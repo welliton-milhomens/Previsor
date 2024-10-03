@@ -1,0 +1,3004 @@
+File: .env
+------------------------
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=finaiti_db
+DB_USER=financeiro_user
+DB_PASSWORD=@FinAiTi
+API_KEY_YAHOO_FINANCE=b3a9833084msh399f6e762e8c372p14290fjsnd51c8487a06b
+ALPHA_VANTAGE_API_KEY=IALU2BYPTYLX81CM
+
+TWITTER_API_KEY = 1fpsViAXd8YX2cbxp2QBksgPO
+TWITTER_API_SECRET_KEY = fjqhcpHqEPtoqZAfEJd7oEecBKnJoyeBwVWhmOHs2MHTfOrjMq
+TWITTER_ACCESS_TOKEN = 1779117560803336192-4WmtlMwbLL81dAngJMyQ1kxTcIxzTK
+TWITTER_ACCESS_TOKEN_SECRET = reJE22xOuBz24UDLIIoI8jQSlMDiz9qCKD3BcTblqOenK
+TWITTER_BEARER_TOKEN = AAAAAAAAAAAAAAAAAAAAAELKvAEAAAAAfdNm9oOOeWHBHFRVtCQnMhXR664%3DUnp6Bol4Pj7I4ssc4odLKhDrqO0QTF0hQWrVJlXC7RJFHhFba4
+
+File: app.py
+------------------------
+import sys
+from flask import Flask, render_template, request, jsonify
+from app.coleta_dados import coletor_sentimento
+from app.coleta_dados.coletor_sentimento import ColetorSentimento
+from app.modelo.treinador import TreinadorKAN
+from app.coleta_dados.coletor_acoes import ColetorAcoes
+from app.coleta_dados.coletor_fiis import ColetorFIIs
+from app.coleta_dados.coletor_dados_economicos import ColetorDadosEconomicos
+from datetime import datetime, timedelta
+import numpy as np
+import logging
+from app.preprocessamento.normalizacao import Normalizador
+from banco_dados.gerenciador_bd import GerenciadorBD
+from functools import lru_cache
+import os
+from sqlalchemy.exc import SQLAlchemyError
+from apscheduler.schedulers.background import BackgroundScheduler
+from dotenv import load_dotenv
+load_dotenv()
+
+# ConfiguraÃ§Ã£o de logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Debug para verificar as variÃ¡veis de ambiente
+load_dotenv()
+
+print("VariÃ¡veis de ambiente:")
+print(f"DB_HOST: {os.getenv('DB_HOST')}")
+print(f"DB_PORT: {os.getenv('DB_PORT')}")
+print(f"DB_NAME: {os.getenv('DB_NAME')}")
+print(f"DB_USER: {os.getenv('DB_USER')}")
+print(f"DB_PASSWORD: {'*' * len(os.getenv('DB_PASSWORD', ''))}")  # NÃ£o exiba a senha real
+
+app = Flask(__name__)
+
+coletor_sentimento = ColetorSentimento()
+
+try:
+    gerenciador_bd = GerenciadorBD()
+    gerenciador_bd.criar_tabelas()
+    if gerenciador_bd.testar_conexao():
+        logger.info("ConexÃ£o com o banco de dados estabelecida com sucesso.")
+    else:
+        logger.error("Falha ao estabelecer conexÃ£o com o banco de dados.")
+        sys.exit(1)
+except SQLAlchemyError as e:
+    logger.error(f"Erro ao conectar ao banco de dados: {str(e)}")
+    sys.exit(1)
+
+treinador = TreinadorKAN(output_dim=1, num_splines=10)
+coletor_acoes = ColetorAcoes()
+coletor_fiis = ColetorFIIs()
+coletor_dados_economicos = ColetorDadosEconomicos()
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+@app.route('/')
+def index():
+    acoes = coletor_acoes.obter_lista_acoes()
+    fiis = coletor_fiis.obter_lista_fiis()
+    return render_template('index.html', acoes=acoes, fiis=fiis)
+
+normalizador = Normalizador()
+
+def inicializar_sistema():
+    logger.info("Iniciando processo de atualizaÃ§Ã£o e treinamento do sistema")
+    
+    # Adicionar restriÃ§Ãµes de unicidade
+    gerenciador_bd.adicionar_restricao_unicidade('acoes', ['acao', 'data'])
+    gerenciador_bd.adicionar_restricao_unicidade('fiis', ['fii', 'data'])
+    gerenciador_bd.adicionar_restricao_unicidade('dados_economicos', ['indicador', 'data'])
+    gerenciador_bd.adicionar_restricao_unicidade('sentimento_mercado', ['ticker', 'data'])
+    
+    # Atualizar dados
+    atualizar_dados_acoes()
+    atualizar_dados_fiis()
+    atualizar_dados_economicos()
+    atualizar_dados_sentimento()
+    
+    # Treinar modelos
+    treinar_modelo('acoes')
+    treinar_modelo('fiis')
+    treinar_modelo('dados_economicos')
+    treinar_modelo('sentimento_mercado')
+    
+    logger.info("Processo de atualizaÃ§Ã£o e treinamento concluÃ­do")
+
+def atualizar_dados_acoes():
+    ultima_atualizacao = gerenciador_bd.obter_ultima_data('acoes')
+    if ultima_atualizacao is None or ultima_atualizacao < datetime.now().date():
+        logger.info("Atualizando dados de aÃ§Ãµes")
+        coletor_acoes.atualizar_dados_acoes()
+
+def atualizar_dados_fiis():
+    ultima_atualizacao = gerenciador_bd.obter_ultima_data('fiis')
+    if ultima_atualizacao is None or ultima_atualizacao < datetime.now().date():
+        logger.info("Atualizando dados de FIIs")
+        coletor_fiis.atualizar_dados_fiis()
+
+def atualizar_dados_economicos():
+    ultima_atualizacao = gerenciador_bd.obter_ultima_data('dados_economicos')
+    if ultima_atualizacao is None or ultima_atualizacao < datetime.now().date():
+        logger.info("Atualizando dados econÃ´micos")
+        coletor_dados_economicos.atualizar_dados_economicos()
+
+def atualizar_dados_sentimento():
+    ultima_atualizacao = gerenciador_bd.obter_ultima_data('sentimento_mercado')
+    if ultima_atualizacao is None or ultima_atualizacao < datetime.now().date():
+        logger.info("Atualizando dados de sentimento")
+        tickers = coletor_acoes.obter_lista_acoes() + coletor_fiis.obter_lista_fiis()
+        coletor_sentimento.atualizar_sentimentos(tickers)
+
+# Agendar a execuÃ§Ã£o diÃ¡ria
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=inicializar_sistema, trigger="cron", hour=0, minute=0)
+scheduler.start()
+
+# Executar a inicializaÃ§Ã£o imediatamente ao iniciar o aplicativo
+inicializar_sistema()
+
+def treinar_modelo(tabela):
+    logger.info(f"Treinando modelo para {tabela}")
+    try:
+        resultado = treinador.treinar(tabela)
+        if resultado is not None:
+            logger.info(f"Modelo treinado com sucesso para {tabela}")
+        else:
+            logger.warning(f"NÃ£o foi possÃ­vel treinar o modelo para {tabela}")
+    except Exception as e:
+        logger.error(f"Erro ao treinar modelo para {tabela}: {str(e)}", exc_info=True)
+
+
+@app.route('/treinar', methods=['POST'])
+def treinar():
+    tabela = request.form['tabela']
+    try:
+        if tabela not in ['acoes', 'fiis', 'dados_economicos']:
+            return jsonify({'erro': 'Tabela invÃ¡lida'}), 400
+
+        if not gerenciador_bd.verificar_tabela(f"{tabela}_normalizados"):
+            return jsonify({'erro': f'Tabela {tabela}_normalizados nÃ£o existe'}), 400
+
+        # Normalizar dados antes do treinamento
+        dados_normalizados = normalizador.normalizar_dados(tabela)
+        if dados_normalizados is not None and not dados_normalizados.empty:
+            logger.info(f"Dados normalizados para {tabela}: {dados_normalizados.shape}")
+            logger.debug(f"Colunas dos dados normalizados: {dados_normalizados.columns}")
+            logger.debug(f"Primeiras linhas dos dados normalizados:\n{dados_normalizados.head()}")
+            normalizador.salvar_dados_normalizados(tabela, dados_normalizados)
+        else:
+            logger.warning(f"NÃ£o foi possÃ­vel normalizar os dados para a tabela {tabela}")
+            return jsonify({'erro': f'NÃ£o foi possÃ­vel normalizar os dados para {tabela}'}), 400
+
+        resultado = treinador.treinar(tabela)
+        if resultado is None:
+            return jsonify({'mensagem': f'NÃ£o foi possÃ­vel treinar o modelo para {tabela} devido a dados insuficientes ou erros.'}), 400
+        return jsonify({'mensagem': f'Modelo treinado e salvo com Ãªxito para {tabela}'})
+    except Exception as e:
+        logger.error(f'Erro ao treinar modelo para {tabela}: {str(e)}', exc_info=True)
+        return jsonify({'erro': f'Erro ao treinar modelo: {str(e)}'}), 500
+
+@app.route('/prever', methods=['GET'])
+def prever():
+    tabela = request.args.get('tabela')
+    tickers = request.args.getlist('tickers')
+    dias = int(request.args.get('dias', 7))
+    
+    logger.debug(f"Iniciando previsÃ£o para tabela: {tabela}, tickers: {tickers}, dias: {dias}")
+    
+    normalizador.carregar_scalers(tabela)
+    
+    # Carregar o modelo antes de fazer previsÃµes
+    treinador.carregar_modelo(tabela)
+    
+    resultados = {}
+    
+    try:
+        for ticker in tickers:
+            X, _ = treinador.preparar_dados(tabela, ticker)
+            if X is None or len(X) < 30:
+                logger.warning(f"Dados histÃ³ricos insuficientes para {ticker}")
+                continue
+
+            X = np.array(X)
+            logger.debug(f"Forma de X para {ticker}: {X.shape}")
+            
+            if treinador.model is None:
+                logger.error("Modelo nÃ£o treinado")
+                return jsonify({'erro': 'Modelo nÃ£o treinado. Por favor, treine o modelo primeiro.'}), 400
+            
+            previsoes_normalizadas = treinador.prever(X[-1:], dias)
+            
+            previsoes_desnormalizadas = [normalizador.desnormalizar_valor(valor, 'fechamento', tabela) for valor in previsoes_normalizadas]
+            
+            ultimos_valores_reais = [normalizador.desnormalizar_valor(valor[3], 'fechamento', tabela) for valor in X[-7:, :, 3]]
+            
+            previsoes_validadas = treinador.validar_previsoes(previsoes_desnormalizadas, ultimos_valores_reais)
+            
+            datas_historicas = [(datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7, 0, -1)]
+            datas_futuras = [(datetime.now() + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(dias)]
+            
+            sentimento_medio = float(X[-1, -1, -1]) if X.shape[2] > 5 else 0.0
+            
+            resultados[ticker] = {
+                'ultimos_valores_reais': ultimos_valores_reais,
+                'datas_historicas': datas_historicas,
+                'previsao': previsoes_validadas,
+                'datas_futuras': datas_futuras,
+                'sentimento_medio': sentimento_medio,
+                'sentimento_incorporado': X.shape[2] > 5
+            }
+        
+        logger.debug(f"Resultados: {resultados}")
+        return jsonify(resultados)
+    except Exception as e:
+        logger.error(f'Erro ao fazer previsÃ£o: {str(e)}', exc_info=True)
+        return jsonify({'erro': f'Erro ao fazer previsÃ£o: {str(e)}'}), 500
+    
+def obter_dados_historicos(tabela, ticker):
+    logger.debug(f"Obtendo dados histÃ³ricos para tabela: {tabela}, ticker: {ticker}")
+    try:
+        if tabela == 'acoes':
+            query = "SELECT abertura, maxima, minima, fechamento, volume FROM acoes_normalizados WHERE acao = :ticker ORDER BY data DESC LIMIT 30"
+        elif tabela == 'fiis':
+            query = "SELECT abertura, maxima, minima, fechamento, volume, dividendos FROM fiis_normalizados WHERE fii = :ticker ORDER BY data DESC LIMIT 30"
+        else:
+            raise ValueError(f"Tabela nÃ£o reconhecida: {tabela}")
+
+        dados = gerenciador_bd.executar_query(query, {'ticker': ticker})
+        
+        if dados.empty or len(dados) < 30:
+            logger.warning(f"Dados insuficientes para {ticker}")
+            return None
+        
+        dados = dados.iloc[::-1]  # Inverter a ordem para que os dados mais recentes estejam no final
+        dados = dados.astype('float32')
+        
+        logger.debug(f"Dados histÃ³ricos (normalizados):\n{dados.head()}")
+        
+        return dados.values
+    except Exception as e:
+        logger.error(f"Erro ao obter dados histÃ³ricos: {str(e)}", exc_info=True)
+        return None
+    
+@app.route('/dados_historicos', methods=['GET'])
+def dados_historicos():
+    tabela = request.args.get('tabela')
+    ticker = request.args.get('ticker')
+    
+    if not tabela or not ticker:
+        return jsonify({'erro': 'ParÃ¢metros invÃ¡lidos'}), 400
+    
+    dados = obter_dados_historicos(tabela, ticker)
+    if dados is None:
+        return jsonify({'erro': 'Dados nÃ£o encontrados'}), 404
+    
+    return jsonify({'dados': dados.tolist()})
+
+@app.route('/comparar', methods=['GET'])
+def comparar():
+    tabela = request.args.get('tabela')
+    tickers = request.args.getlist('tickers')
+    
+    if not tabela or not tickers:
+        return jsonify({'erro': 'ParÃ¢metros invÃ¡lidos'}), 400
+    
+    resultados = {}
+    for ticker in tickers:
+        dados = obter_dados_historicos(tabela, ticker)
+        if dados is not None:
+            resultados[ticker] = dados.tolist()
+    
+    return jsonify(resultados)
+
+@app.route('/atualizar_sentimentos', methods=['POST'])
+def atualizar_sentimentos():
+    tickers = request.json.get('tickers', [])
+    if not tickers:
+        return jsonify({'erro': 'Nenhum ticker fornecido'}), 400
+    
+    try:
+        coletor_sentimento = ColetorSentimento()
+        coletor_sentimento.atualizar_sentimentos(tickers)
+        return jsonify({'mensagem': 'Sentimentos atualizados com sucesso'})
+    except Exception as e:
+        logger.error(f'Erro ao atualizar sentimentos: {str(e)}', exc_info=True)
+        return jsonify({'erro': f'Erro ao atualizar sentimentos: {str(e)}'}), 500
+    
+
+if __name__ == '__main__':
+    print("Servidor iniciando...")
+    print("Acesse http://127.0.0.1:5000 no seu navegador")
+    app.run(debug=True, use_reloader=False)
+
+File: requirements.txt
+------------------------
+absl-py==2.1.0
+aiohttp==3.9.5
+aiosignal==1.3.1
+alabaster @ file:///home/conda/feedstock_root/build_artifacts/alabaster_1704848697227/work
+alembic==1.13.1
+alpha_vantage==3.0.0
+annotated-types==0.7.0
+anyio @ file:///home/conda/feedstock_root/build_artifacts/anyio_1717693030552/work
+argon2-cffi @ file:///home/conda/feedstock_root/build_artifacts/argon2-cffi_1692818318753/work
+argon2-cffi-bindings @ file:///D:/bld/argon2-cffi-bindings_1695386877556/work
+arrow @ file:///home/conda/feedstock_root/build_artifacts/arrow_1696128962909/work
+astroid @ file:///D:/bld/astroid_1716193889563/work
+asttokens @ file:///home/conda/feedstock_root/build_artifacts/asttokens_1698341106958/work
+astunparse==1.6.3
+async-lru @ file:///home/conda/feedstock_root/build_artifacts/async-lru_1690563019058/work
+async-timeout==4.0.3
+atomicwrites @ file:///home/conda/feedstock_root/build_artifacts/atomicwrites_1657325823582/work
+attrs @ file:///home/conda/feedstock_root/build_artifacts/attrs_1704011227531/work
+autopage==0.5.2
+autopep8 @ file:///home/conda/feedstock_root/build_artifacts/autopep8_1693061251004/work
+Babel @ file:///home/conda/feedstock_root/build_artifacts/babel_1702422572539/work
+backports.tarfile @ file:///home/conda/feedstock_root/build_artifacts/backports.tarfile_1712700614056/work
+bcrypt @ file:///D:/bld/bcrypt_1715971809558/work
+beautifulsoup4 @ file:///home/conda/feedstock_root/build_artifacts/beautifulsoup4_1705564648255/work
+binaryornot==0.4.4
+black @ file:///D:/bld/black-recipe_1714119777660/work
+bleach @ file:///home/conda/feedstock_root/build_artifacts/bleach_1696630167146/work
+blinker==1.8.2
+Brotli @ file:///D:/bld/brotli-split_1695989908365/work
+cached-property @ file:///home/conda/feedstock_root/build_artifacts/cached_property_1615209429212/work
+certifi @ file:///home/conda/feedstock_root/build_artifacts/certifi_1718025014955/work/certifi
+cffi @ file:///D:/bld/cffi_1696001739918/work
+chardet @ file:///D:/bld/chardet_1695468773258/work
+charset-normalizer @ file:///home/conda/feedstock_root/build_artifacts/charset-normalizer_1698833585322/work
+click @ file:///D:/bld/click_1692312014553/work
+cliff==4.7.0
+cloudpickle @ file:///home/conda/feedstock_root/build_artifacts/cloudpickle_1697464713350/work
+cmaes==0.10.0
+cmd2==2.4.3
+colorama @ file:///home/conda/feedstock_root/build_artifacts/colorama_1666700638685/work
+colorlog==6.8.2
+comm @ file:///home/conda/feedstock_root/build_artifacts/comm_1710320294760/work
+contourpy==1.2.1
+cookiecutter @ file:///home/conda/feedstock_root/build_artifacts/cookiecutter_1708608886262/work
+cryptography @ file:///D:/bld/cryptography-split_1717559564603/work
+cycler==0.12.1
+debugpy @ file:///D:/bld/debugpy_1707444604970/work
+decorator @ file:///home/conda/feedstock_root/build_artifacts/decorator_1641555617451/work
+defusedxml @ file:///home/conda/feedstock_root/build_artifacts/defusedxml_1615232257335/work
+diff-match-patch @ file:///home/conda/feedstock_root/build_artifacts/diff-match-patch_1683670697993/work
+dill @ file:///home/conda/feedstock_root/build_artifacts/dill_1706434688412/work
+dnspython==2.6.1
+docstring-to-markdown @ file:///home/conda/feedstock_root/build_artifacts/docstring-to-markdown_1708563025188/work
+docutils @ file:///home/conda/feedstock_root/build_artifacts/docutils_1713930378730/work
+email_validator==2.1.1
+entrypoints @ file:///home/conda/feedstock_root/build_artifacts/entrypoints_1643888246732/work
+exceptiongroup @ file:///home/conda/feedstock_root/build_artifacts/exceptiongroup_1704921103267/work
+executing @ file:///home/conda/feedstock_root/build_artifacts/executing_1698579936712/work
+fastapi==0.111.0
+fastapi-cli==0.0.4
+fastjsonschema @ file:///home/conda/feedstock_root/build_artifacts/python-fastjsonschema_1703780968325/work/dist
+filelock @ file:///home/conda/feedstock_root/build_artifacts/filelock_1714422806336/work
+flake8 @ file:///home/conda/feedstock_root/build_artifacts/flake8_1704483779980/work
+Flask==3.0.3
+flatbuffers==24.3.25
+fonttools==4.53.0
+fqdn @ file:///home/conda/feedstock_root/build_artifacts/fqdn_1638810296540/work/dist
+frozendict==2.4.4
+frozenlist==1.4.1
+fsspec==2024.6.0
+future==1.0.0
+gast==0.5.4
+google-pasta==0.2.0
+greenlet==3.0.3
+grpcio==1.64.1
+h11 @ file:///home/conda/feedstock_root/build_artifacts/h11_1664132893548/work
+h2 @ file:///home/conda/feedstock_root/build_artifacts/h2_1634280454336/work
+h5py==3.11.0
+hpack==4.0.0
+html5lib==1.1
+httpcore @ file:///home/conda/feedstock_root/build_artifacts/httpcore_1711596990900/work
+httptools==0.6.1
+httpx @ file:///home/conda/feedstock_root/build_artifacts/httpx_1708530890843/work
+hyperframe @ file:///home/conda/feedstock_root/build_artifacts/hyperframe_1619110129307/work
+idna @ file:///home/conda/feedstock_root/build_artifacts/idna_1713279365350/work
+imagesize @ file:///home/conda/feedstock_root/build_artifacts/imagesize_1656939531508/work
+importlib_metadata @ file:///home/conda/feedstock_root/build_artifacts/importlib-metadata_1710971335535/work
+importlib_resources @ file:///home/conda/feedstock_root/build_artifacts/importlib_resources_1711040877059/work
+inflection @ file:///home/conda/feedstock_root/build_artifacts/inflection_1598089801258/work
+intel-openmp==2021.4.0
+intervaltree @ file:///home/conda/feedstock_root/build_artifacts/intervaltree_1683532206518/work
+ipykernel @ file:///D:/bld/ipykernel_1717717683217/work
+ipython @ file:///D:/bld/ipython_1701831845989/work
+ipywidgets @ file:///home/conda/feedstock_root/build_artifacts/ipywidgets_1716897651763/work
+isoduration @ file:///home/conda/feedstock_root/build_artifacts/isoduration_1638811571363/work/dist
+isort @ file:///home/conda/feedstock_root/build_artifacts/isort_1702518492027/work
+itsdangerous==2.2.0
+jaraco.classes @ file:///home/conda/feedstock_root/build_artifacts/jaraco.classes_1713939306738/work
+jaraco.context @ file:///home/conda/feedstock_root/build_artifacts/jaraco.context_1714372187587/work
+jaraco.functools @ file:///home/conda/feedstock_root/build_artifacts/jaraco.functools_1701695162614/work
+jedi @ file:///home/conda/feedstock_root/build_artifacts/jedi_1696326070614/work
+jellyfish @ file:///D:/bld/jellyfish_1716993225584/work
+Jinja2 @ file:///home/conda/feedstock_root/build_artifacts/jinja2_1715127149914/work
+joblib==1.4.2
+json5 @ file:///home/conda/feedstock_root/build_artifacts/json5_1712986206667/work
+jsonpointer @ file:///D:/bld/jsonpointer_1695397475147/work
+jsonschema @ file:///home/conda/feedstock_root/build_artifacts/jsonschema-meta_1714573116818/work
+jsonschema-specifications @ file:///tmp/tmpkv1z7p57/src
+jupyter @ file:///home/conda/feedstock_root/build_artifacts/jupyter_1696255489086/work
+jupyter-console @ file:///home/conda/feedstock_root/build_artifacts/jupyter_console_1678118109161/work
+jupyter-events @ file:///home/conda/feedstock_root/build_artifacts/jupyter_events_1710805637316/work
+jupyter-lsp @ file:///home/conda/feedstock_root/build_artifacts/jupyter-lsp-meta_1712707420468/work/jupyter-lsp
+jupyter_client @ file:///home/conda/feedstock_root/build_artifacts/jupyter_client_1716472197302/work
+jupyter_core @ file:///D:/bld/jupyter_core_1710257377578/work
+jupyter_server @ file:///home/conda/feedstock_root/build_artifacts/jupyter_server_1717122053158/work
+jupyter_server_terminals @ file:///home/conda/feedstock_root/build_artifacts/jupyter_server_terminals_1710262634903/work
+jupyterlab==4.2.1
+jupyterlab_pygments @ file:///home/conda/feedstock_root/build_artifacts/jupyterlab_pygments_1707149102966/work
+jupyterlab_server @ file:///home/conda/feedstock_root/build_artifacts/jupyterlab_server-split_1716433953404/work
+jupyterlab_widgets @ file:///home/conda/feedstock_root/build_artifacts/jupyterlab_widgets_1716891641122/work
+keras==3.3.3
+keyring @ file:///D:/bld/keyring_1715715360437/work
+kiwisolver==1.4.5
+libclang==18.1.1
+lightning==2.2.5
+lightning-utilities==0.11.2
+lxml==5.2.2
+Mako==1.3.5
+Markdown==3.6
+markdown-it-py @ file:///home/conda/feedstock_root/build_artifacts/markdown-it-py_1686175045316/work
+MarkupSafe @ file:///D:/bld/markupsafe_1706900063757/work
+matplotlib==3.9.0
+matplotlib-inline @ file:///home/conda/feedstock_root/build_artifacts/matplotlib-inline_1713250518406/work
+mccabe @ file:///home/conda/feedstock_root/build_artifacts/mccabe_1643049622439/work
+mdurl @ file:///home/conda/feedstock_root/build_artifacts/mdurl_1704317613764/work
+mistune @ file:///home/conda/feedstock_root/build_artifacts/mistune_1698947099619/work
+mkl==2021.4.0
+ml-dtypes==0.3.2
+more-itertools @ file:///home/conda/feedstock_root/build_artifacts/more-itertools_1704738417589/work
+mpmath @ file:///home/conda/feedstock_root/build_artifacts/mpmath_1678228039184/work
+multidict==6.0.5
+multitasking==0.0.11
+mypy-extensions @ file:///home/conda/feedstock_root/build_artifacts/mypy_extensions_1675543315189/work
+namex==0.0.8
+nbclient @ file:///home/conda/feedstock_root/build_artifacts/nbclient_1710317608672/work
+nbconvert @ file:///home/conda/feedstock_root/build_artifacts/nbconvert-meta_1714477135335/work
+nbformat @ file:///home/conda/feedstock_root/build_artifacts/nbformat_1712238998817/work
+nest_asyncio @ file:///home/conda/feedstock_root/build_artifacts/nest-asyncio_1705850609492/work
+networkx @ file:///home/conda/feedstock_root/build_artifacts/networkx_1698504735452/work
+nltk==3.8.1
+notebook @ file:///home/conda/feedstock_root/build_artifacts/notebook_1717767745914/work
+notebook_shim @ file:///home/conda/feedstock_root/build_artifacts/notebook-shim_1707957777232/work
+numpy @ file:///D:/bld/numpy_1707225561314/work/dist/numpy-1.26.4-cp39-cp39-win_amd64.whl#sha256=af5f40857bb7ceb2d3be562fa763863d2f954c104873e89b8ee370f75e047ecf
+numpydoc @ file:///home/conda/feedstock_root/build_artifacts/numpydoc_1717502870243/work
+opt-einsum==3.3.0
+optree==0.11.0
+optuna==3.6.1
+orjson==3.10.3
+overrides @ file:///home/conda/feedstock_root/build_artifacts/overrides_1706394519472/work
+packaging @ file:///home/conda/feedstock_root/build_artifacts/packaging_1710075952259/work
+pandas==2.2.2
+pandocfilters @ file:///home/conda/feedstock_root/build_artifacts/pandocfilters_1631603243851/work
+paramiko @ file:///home/conda/feedstock_root/build_artifacts/paramiko_1703015906107/work
+parso @ file:///home/conda/feedstock_root/build_artifacts/parso_1712320355065/work
+pathspec @ file:///home/conda/feedstock_root/build_artifacts/pathspec_1702249949303/work
+patsy==0.5.6
+pbr==6.0.0
+peewee==3.17.5
+pexpect @ file:///home/conda/feedstock_root/build_artifacts/pexpect_1706113125309/work
+pickleshare @ file:///home/conda/feedstock_root/build_artifacts/pickleshare_1602536217715/work
+pillow @ file:///D:/bld/pillow_1712154573692/work
+pkgutil_resolve_name @ file:///home/conda/feedstock_root/build_artifacts/pkgutil-resolve-name_1694617248815/work
+platformdirs @ file:///home/conda/feedstock_root/build_artifacts/platformdirs_1715777629804/work
+pluggy @ file:///home/conda/feedstock_root/build_artifacts/pluggy_1713667077545/work
+ply @ file:///home/conda/feedstock_root/build_artifacts/ply_1712242996588/work
+prettytable==3.10.0
+prometheus_client @ file:///home/conda/feedstock_root/build_artifacts/prometheus_client_1707932675456/work
+prompt_toolkit @ file:///home/conda/feedstock_root/build_artifacts/prompt-toolkit_1717583537988/work
+protobuf==4.25.3
+psutil @ file:///D:/bld/psutil_1705722541723/work
+psycopg2-binary==2.9.9
+ptyprocess @ file:///home/conda/feedstock_root/build_artifacts/ptyprocess_1609419310487/work/dist/ptyprocess-0.7.0-py2.py3-none-any.whl
+pure-eval @ file:///home/conda/feedstock_root/build_artifacts/pure_eval_1642875951954/work
+pycodestyle @ file:///home/conda/feedstock_root/build_artifacts/pycodestyle_1697202867721/work
+pycparser @ file:///home/conda/feedstock_root/build_artifacts/pycparser_1711811537435/work
+pydantic==2.7.3
+pydantic_core==2.18.4
+pyDeprecate==0.3.1
+pydocstyle @ file:///home/conda/feedstock_root/build_artifacts/pydocstyle_1673997487070/work
+pyflakes @ file:///home/conda/feedstock_root/build_artifacts/pyflakes_1704424584912/work
+Pygments @ file:///home/conda/feedstock_root/build_artifacts/pygments_1714846767233/work
+pylint @ file:///home/conda/feedstock_root/build_artifacts/pylint_1717705591781/work
+pylint-venv @ file:///home/conda/feedstock_root/build_artifacts/pylint-venv_1698219336631/work
+pyls-spyder @ file:///home/conda/feedstock_root/build_artifacts/pyls-spyder_1619747398504/work
+PyNaCl @ file:///D:/bld/pynacl_1695545054459/work
+pyparsing==3.1.2
+pyperclip==1.8.2
+PyQt5==5.15.9
+PyQt5-sip @ file:///D:/bld/pyqt-split_1695417932202/work/pyqt_sip
+PyQtWebEngine==5.15.4
+pyreadline3==3.4.1
+PySocks @ file:///D:/bld/pysocks_1661604991356/work
+python-dateutil @ file:///home/conda/feedstock_root/build_artifacts/python-dateutil_1709299778482/work
+python-dotenv==1.0.1
+python-json-logger @ file:///home/conda/feedstock_root/build_artifacts/python-json-logger_1677079630776/work
+python-lsp-black @ file:///home/conda/feedstock_root/build_artifacts/python-lsp-black_1702956932456/work
+python-lsp-jsonrpc @ file:///home/conda/feedstock_root/build_artifacts/python-lsp-jsonrpc_1695528365348/work
+python-lsp-server @ file:///home/conda/feedstock_root/build_artifacts/python-lsp-server-meta_1711734797703/work
+python-multipart==0.0.9
+python-slugify @ file:///home/conda/feedstock_root/build_artifacts/python-slugify-split_1707425621764/work
+pytoolconfig @ file:///home/conda/feedstock_root/build_artifacts/pytoolconfig_1675124745143/work
+pytorch-forecasting==1.0.0
+pytorch-lightning==2.2.5
+pytorch_optimizer==2.12.0
+pytz @ file:///home/conda/feedstock_root/build_artifacts/pytz_1706886791323/work
+pywin32==306
+pywin32-ctypes @ file:///D:/bld/pywin32-ctypes_1695395076921/work
+pywinpty @ file:///D:/bld/pywinpty_1708993010363/work/target/wheels/pywinpty-2.0.13-cp39-none-win_amd64.whl#sha256=84b4ae7fb10140f362ee7ce26d822343cddcefa8007d779a0392e447cd05b281
+PyYAML @ file:///D:/bld/pyyaml_1695373613960/work
+pyzmq @ file:///D:/bld/pyzmq_1715024536945/work
+QDarkStyle @ file:///home/conda/feedstock_root/build_artifacts/qdarkstyle_1702957860620/work
+qstylizer @ file:///home/conda/feedstock_root/build_artifacts/qstylizer_1713394158018/work/dist/qstylizer-0.2.3-py2.py3-none-any.whl#sha256=9f7b5d720ea5b7459972f570e09067f8286e9d00955e2b91ef2bd4d0b5edce1c
+QtAwesome @ file:///home/conda/feedstock_root/build_artifacts/qtawesome_1711652164228/work
+qtconsole @ file:///home/conda/feedstock_root/build_artifacts/qtconsole-base_1714942934316/work
+QtPy @ file:///home/conda/feedstock_root/build_artifacts/qtpy_1698112029416/work
+referencing @ file:///home/conda/feedstock_root/build_artifacts/referencing_1714619483868/work
+regex==2024.7.24
+requests @ file:///home/conda/feedstock_root/build_artifacts/requests_1717057054362/work
+rfc3339-validator @ file:///home/conda/feedstock_root/build_artifacts/rfc3339-validator_1638811747357/work
+rfc3986-validator @ file:///home/conda/feedstock_root/build_artifacts/rfc3986-validator_1598024191506/work
+rich @ file:///home/conda/feedstock_root/build_artifacts/rich-split_1709150387247/work/dist
+rope @ file:///home/conda/feedstock_root/build_artifacts/rope_1711296293824/work
+rpds-py @ file:///D:/bld/rpds-py_1715090106700/work
+Rtree @ file:///D:/bld/rtree_1705698060554/work
+scikeras==0.13.0
+scikit-learn==1.5.0
+scipy==1.13.1
+seaborn==0.13.2
+Send2Trash @ file:///D:/bld/send2trash_1712585174948/work
+shellingham==1.5.4
+sip @ file:///D:/bld/sip_1697300548918/work
+six @ file:///home/conda/feedstock_root/build_artifacts/six_1620240208055/work
+sniffio @ file:///home/conda/feedstock_root/build_artifacts/sniffio_1708952932303/work
+snowballstemmer @ file:///home/conda/feedstock_root/build_artifacts/snowballstemmer_1637143057757/work
+sortedcontainers @ file:///home/conda/feedstock_root/build_artifacts/sortedcontainers_1621217038088/work
+soupsieve @ file:///home/conda/feedstock_root/build_artifacts/soupsieve_1693929250441/work
+Sphinx @ file:///home/conda/feedstock_root/build_artifacts/sphinx_1713554891974/work
+sphinxcontrib-applehelp @ file:///home/conda/feedstock_root/build_artifacts/sphinxcontrib-applehelp_1705126298355/work
+sphinxcontrib-devhelp @ file:///home/conda/feedstock_root/build_artifacts/sphinxcontrib-devhelp_1705126010477/work
+sphinxcontrib-htmlhelp @ file:///home/conda/feedstock_root/build_artifacts/sphinxcontrib-htmlhelp_1705118152391/work
+sphinxcontrib-jsmath @ file:///home/conda/feedstock_root/build_artifacts/sphinxcontrib-jsmath_1691604704163/work
+sphinxcontrib-qthelp @ file:///home/conda/feedstock_root/build_artifacts/sphinxcontrib-qthelp_1705126152907/work
+sphinxcontrib-serializinghtml @ file:///home/conda/feedstock_root/build_artifacts/sphinxcontrib-serializinghtml_1705118225549/work
+spyder @ file:///D:/bld/spyder_1712781107353/work
+spyder-kernels @ file:///D:/bld/spyder-kernels_1709087829200/work
+SQLAlchemy==2.0.30
+stack-data @ file:///home/conda/feedstock_root/build_artifacts/stack_data_1669632077133/work
+starlette==0.37.2
+statsmodels==0.14.2
+stevedore==5.2.0
+sympy @ file:///home/conda/feedstock_root/build_artifacts/sympy_1684180539862/work
+tabulate @ file:///home/conda/feedstock_root/build_artifacts/tabulate_1665138452165/work
+tbb==2021.12.0
+tensorboard==2.16.2
+tensorboard-data-server==0.7.2
+tensorflow==2.16.1
+tensorflow-intel==2.16.1
+tensorflow-io-gcs-filesystem==0.31.0
+termcolor==2.4.0
+terminado @ file:///D:/bld/terminado_1710262761616/work
+text-unidecode @ file:///home/conda/feedstock_root/build_artifacts/text-unidecode_1694707102786/work
+textblob==0.18.0.post0
+textdistance @ file:///home/conda/feedstock_root/build_artifacts/textdistance_1714078304435/work
+threadpoolctl==3.5.0
+three-merge @ file:///home/conda/feedstock_root/build_artifacts/three-merge_1595515817927/work
+tinycss2 @ file:///home/conda/feedstock_root/build_artifacts/tinycss2_1713974937325/work
+toml @ file:///home/conda/feedstock_root/build_artifacts/toml_1604308577558/work
+tomli @ file:///home/conda/feedstock_root/build_artifacts/tomli_1644342247877/work
+tomlkit @ file:///home/conda/feedstock_root/build_artifacts/tomlkit_1715185399719/work
+torch==2.3.1
+torchaudio==2.3.1
+torchmetrics==1.4.0.post0
+torchvision==0.18.1
+tornado @ file:///D:/bld/tornado_1717722891796/work
+tqdm==4.66.4
+traitlets @ file:///home/conda/feedstock_root/build_artifacts/traitlets_1713535121073/work
+typer==0.12.3
+types-python-dateutil @ file:///home/conda/feedstock_root/build_artifacts/types-python-dateutil_1710589910274/work
+typing==3.7.4.3
+typing-utils @ file:///home/conda/feedstock_root/build_artifacts/typing_utils_1622899189314/work
+typing_extensions @ file:///home/conda/feedstock_root/build_artifacts/typing_extensions_1717802530399/work
+tzdata==2024.1
+ujson @ file:///D:/bld/ujson_1715783264372/work
+uri-template @ file:///home/conda/feedstock_root/build_artifacts/uri-template_1688655812972/work/dist
+urllib3 @ file:///home/conda/feedstock_root/build_artifacts/urllib3_1708239446578/work
+uvicorn==0.30.1
+watchdog @ file:///D:/bld/watchdog_1716561913175/work
+watchfiles==0.22.0
+wcwidth @ file:///home/conda/feedstock_root/build_artifacts/wcwidth_1704731205417/work
+webcolors @ file:///home/conda/feedstock_root/build_artifacts/webcolors_1717667289718/work
+webencodings @ file:///home/conda/feedstock_root/build_artifacts/webencodings_1694681268211/work
+websocket-client @ file:///home/conda/feedstock_root/build_artifacts/websocket-client_1713923384721/work
+websockets==12.0
+Werkzeug==3.0.3
+whatthepatch @ file:///home/conda/feedstock_root/build_artifacts/whatthepatch_1683396758362/work
+widgetsnbextension @ file:///home/conda/feedstock_root/build_artifacts/widgetsnbextension_1716891659446/work
+win-inet-pton @ file:///D:/bld/win_inet_pton_1667051142467/work
+wrapt==1.16.0
+yapf @ file:///home/conda/feedstock_root/build_artifacts/yapf_1690387939953/work
+yarl==1.9.4
+yfinance==0.2.40
+zipp @ file:///home/conda/feedstock_root/build_artifacts/zipp_1717845438511/work
+select2==4.1.0-rc.0
+pip install tweepy textblob
+
+File: teste_twiter.py
+------------------------
+import tweepy
+# Suas chaves de acesso
+API_KEY = '1fpsViAXd8YX2cbxp2QBksgPO'
+API_SECRET_KEY = 'fjqhcpHqEPtoqZAfEJd7oEecBKnJoyeBwVWhmOHs2MHTfOrjMq'
+ACCESS_TOKEN = '1779117560803336192-4WmtlMwbLL81dAngJMyQ1kxTcIxzTK'
+ACCESS_TOKEN_SECRET = 'reJE22xOuBz24UDLIIoI8jQSlMDiz9qCKD3BcTblqOenK'
+
+# AutenticaÃ§Ã£o
+auth = tweepy.OAuth1UserHandler(API_KEY, API_SECRET_KEY, ACCESS_TOKEN, ACCESS_TOKEN_SECRET)
+api = tweepy.API(auth)
+
+# Exemplo: pegar a linha do tempo do usuÃ¡rio autenticado
+tweets = api.home_timeline()
+for tweet in tweets:
+    print(f"{tweet.user.name} disseÂ {tweet.text}")
+
+File: __init__.py
+------------------------
+
+File: app\__init__.py
+------------------------
+
+File: app\coleta_dados\coletor_acoes.py
+------------------------
+from datetime import timedelta
+import os
+import sys
+import yfinance as yf
+import pandas as pd
+
+# Adicione o diretÃ³rio raiz do projeto ao PYTHONPATH
+projeto_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, projeto_dir)
+
+from banco_dados.gerenciador_bd import GerenciadorBD
+
+class ColetorAcoes:
+    def __init__(self):
+        self.gerenciador_bd = GerenciadorBD()
+
+    def obter_lista_acoes(self):
+        # Aqui vocÃª deve implementar a lÃ³gica para obter a lista de todas as aÃ§Ãµes da B3
+        # Por simplicidade, vamos usar uma lista estÃ¡tica por enquanto
+        return ['PETR4.SA', 'VALE3.SA', 'ITUB4.SA']
+
+    def coletar_dados_acoes(self, periodo='1y'):
+        acoes = self.obter_lista_acoes()
+        for acao in acoes:
+            dados = yf.Ticker(acao).history(period=periodo)
+            self.salvar_dados_acao(acao, dados)
+
+    def salvar_dados_acao(self, acao, dados):
+        dados_filtrados = []
+        for index, row in dados.iterrows():
+            dados_filtrados.append({
+                'acao': acao,
+                'data': index.date(),
+                'abertura': row['Open'],
+                'maxima': row['High'],
+                'minima': row['Low'],
+                'fechamento': row['Close'],
+                'volume': row['Volume']
+            })
+        self.gerenciador_bd.upsert_dados('acoes', dados_filtrados, ['acao', 'data'])
+
+    def atualizar_dados_acoes(self):
+        acoes = self.obter_lista_acoes()
+        for acao in acoes:
+            ultima_data = self.gerenciador_bd.obter_ultima_data('acoes', acao)
+            if ultima_data:
+                start_date = ultima_data + timedelta(days=1)
+                dados = yf.Ticker(acao).history(start=start_date)
+            else:
+                dados = yf.Ticker(acao).history(period="max")
+            self.salvar_dados_acao(acao, dados)
+
+    def obter_dados_historicos(self, acao, periodo='30d'):
+        dados = yf.Ticker(acao).history(period=periodo)
+        return dados[['Open', 'High', 'Low', 'Close', 'Volume']].rename(
+            columns={'Open': 'abertura', 'High': 'maxima', 'Low': 'minima', 'Close': 'fechamento'}
+        )
+
+if __name__ == '__main__':
+    coletor = ColetorAcoes()
+    coletor.coletar_dados_acoes()
+
+File: app\coleta_dados\coletor_dados_economicos.py
+------------------------
+from datetime import datetime, timedelta
+import os
+import sys
+import yfinance as yf
+import pandas as pd
+import requests
+from functools import lru_cache
+from retrying import retry
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Adicione o diretÃ³rio raiz do projeto ao PYTHONPATH
+projeto_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, projeto_dir)
+
+from banco_dados.gerenciador_bd import GerenciadorBD
+
+class ColetorDadosEconomicos:
+    def __init__(self):
+        self.gerenciador_bd = GerenciadorBD()
+        self.base_url = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{}/dados?formato=json"
+        logger.info("ColetorDadosEconomicos inicializado")
+
+    def coletar_dados_economicos(self):
+        # Lista de cÃ³digos de sÃ©ries do Banco Central
+        series = {
+            'pib': 4380,
+            'inflacao': 433,
+            'selic': 432,
+            'cambio': 1
+        }
+
+        for nome, codigo in series.items():
+            dados = self.obter_dados_serie(codigo)
+            self.salvar_dados_economicos(nome, dados)
+
+    @retry(stop_max_attempt_number=3, wait_fixed=2000)
+    def obter_dados_serie(self, codigo, data_inicial=None):
+        url = self.base_url.format(codigo)
+        if data_inicial:
+            url += f"&dataInicial={data_inicial.strftime('%d/%m/%Y')}"
+        response = requests.get(url)
+        response.raise_for_status()  # Isso levantarÃ¡ uma exceÃ§Ã£o para status codes de erro
+        return pd.DataFrame(response.json())
+        
+    @lru_cache(maxsize=32)
+    def obter_dados_serie_cache(self, codigo, dias=30):
+        data_inicio = datetime.now() - timedelta(days=dias)
+        url = f"{self.base_url.format(codigo)}&dataInicial={data_inicio.strftime('%d/%m/%Y')}"
+        return self.obter_dados_serie(codigo, url)
+
+    def salvar_dados_economicos(self, nome, dados):
+        if not dados.empty:
+            dados['indicador'] = nome
+            dados.rename(columns={'data': 'data', 'valor': 'valor'}, inplace=True)
+            self.gerenciador_bd.upsert_dados('dados_economicos', dados.to_dict('records'), ['indicador', 'data'])
+            logger.info(f"Dados econÃ´micos para {nome} atualizados com sucesso")
+   
+    def atualizar_dados_economicos(self):
+        series = {
+            'pib': 4380,
+            'inflacao': 433,
+            'selic': 432,
+            'cambio': 1
+        }
+
+        for nome, codigo in series.items():
+            ultima_data = self.gerenciador_bd.obter_ultima_data('dados_economicos', nome)
+            if ultima_data:
+                data_inicial = ultima_data + timedelta(days=1)
+                dados = self.obter_dados_serie(codigo, data_inicial)
+            else:
+                dados = self.obter_dados_serie(codigo)
+            
+            if not dados.empty:
+                self.salvar_dados_economicos(nome, dados)
+
+if __name__ == '__main__':
+    coletor = ColetorDadosEconomicos()
+    coletor.coletar_dados_economicos()
+
+File: app\coleta_dados\coletor_fiis.py
+------------------------
+import os
+import sys
+import yfinance as yf
+import pandas as pd
+
+# Adicione o diretÃ³rio raiz do projeto ao PYTHONPATH
+projeto_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, projeto_dir)
+
+from banco_dados.gerenciador_bd import GerenciadorBD
+
+class ColetorFIIs:
+    def __init__(self):
+        self.gerenciador_bd = GerenciadorBD()
+
+    def obter_lista_fiis(self):
+        # Aqui vocÃª deve implementar a lÃ³gica para obter a lista de todos os FIIs da B3
+        # Por simplicidade, vamos usar uma lista estÃ¡tica por enquanto
+        return ['HGLG11.SA', 'KNRI11.SA', 'MXRF11.SA']
+
+    def coletar_dados_fiis(self, periodo='1y'):
+        fiis = self.obter_lista_fiis()
+        for fii in fiis:
+            dados = yf.Ticker(fii).history(period=periodo)
+            self.salvar_dados_fii(fii, dados)
+
+    def salvar_dados_fii(self, fii, dados):
+        dados['fii'] = fii
+        dados.reset_index(inplace=True)
+        dados.rename(columns={
+            'Date': 'data',
+            'Open': 'abertura',
+            'High': 'maxima',
+            'Low': 'minima',
+            'Close': 'fechamento',
+            'Volume': 'volume',
+            'Dividends': 'dividendos'
+        }, inplace=True)
+        
+        colunas_necessarias = ['fii', 'data', 'abertura', 'maxima', 'minima', 'fechamento', 'volume', 'dividendos']
+        for coluna in colunas_necessarias:
+            if coluna not in dados.columns:
+                dados[coluna] = 0
+        
+        dados = dados[colunas_necessarias]
+        
+        self.gerenciador_bd.upsert_dados('fiis', dados.to_dict('records'), ['fii', 'data'])
+
+    def atualizar_dados_fiis(self, periodo='1d'):
+        fiis = self.obter_lista_fiis()
+        for fii in fiis:
+            ultima_data = self.gerenciador_bd.executar_query(
+                "SELECT MAX(data) FROM fiis WHERE fii = :fii",
+                {'fii': fii}
+            ).iloc[0][0]
+            if ultima_data:
+                start_date = ultima_data + pd.Timedelta(days=1)
+                dados = yf.Ticker(fii).history(start=start_date)
+                self.salvar_dados_fii(fii, dados)
+
+if __name__ == '__main__':
+    coletor = ColetorFIIs()
+    coletor.coletar_dados_fiis()
+
+File: app\coleta_dados\coletor_sentimento.py
+------------------------
+import os
+import sys
+from venv import logger
+import pandas as pd
+from datetime import datetime, timedelta
+import tweepy
+from dotenv import load_dotenv
+from textblob import TextBlob
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Adicione o diretÃ³rio raiz do projeto ao PYTHONPATH
+projeto_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, projeto_dir)
+
+from banco_dados.gerenciador_bd import GerenciadorBD
+from app.preprocessamento.analisador_sentimento import AnalisadorSentimento, mapear_sentimento
+
+load_dotenv()
+
+class ColetorSentimento:
+    def __init__(self):
+        self.client = tweepy.Client(
+            bearer_token=os.getenv('TWITTER_BEARER_TOKEN'),
+            consumer_key=os.getenv('TWITTER_API_KEY'),
+            consumer_secret=os.getenv('TWITTER_API_SECRET_KEY'),
+            access_token=os.getenv('TWITTER_ACCESS_TOKEN'),
+            access_token_secret=os.getenv('TWITTER_ACCESS_TOKEN_SECRET')
+        )
+        self.gerenciador_bd = GerenciadorBD()
+        self.analisador = AnalisadorSentimento()
+
+    def atualizar_sentimentos(self, tickers):
+        logger.info("Iniciando atualizaÃ§Ã£o de sentimentos")
+        for ticker in tickers:
+            ultima_data = self.gerenciador_bd.obter_ultima_data('sentimento_mercado', ticker)
+            if ultima_data is None or ultima_data < datetime.now().date():
+                sentimentos = self.coletar_e_analisar_tweets(ticker)
+                self.salvar_sentimentos(sentimentos)
+        logger.info("AtualizaÃ§Ã£o de sentimentos concluÃ­da")
+
+    def coletar_tweets(self, ticker, dias=7):
+        query = f"${ticker} -is:retweet lang:pt"
+        data_limite = datetime.now() - timedelta(days=dias)
+        tweets = []
+
+        try:
+            for tweet in tweepy.Paginator(self.client.search_recent_tweets, 
+                                          query=query, 
+                                          max_results=100,
+                                          tweet_fields=['created_at', 'text']).flatten(limit=1000):
+                if tweet.created_at < data_limite:
+                    break
+                tweets.append({'data': tweet.created_at, 'texto': tweet.text})
+
+            return pd.DataFrame(tweets)
+        except Exception as e:
+            logger.error(f"Erro ao coletar tweets para {ticker}: {str(e)}")
+            return pd.DataFrame(columns=['data', 'texto'])
+
+    def coletar_e_analisar_tweets(self, ticker, dias=7):
+        tweets_df = self.coletar_tweets(ticker, dias)
+        sentimentos = []
+        for _, tweet in tweets_df.iterrows():
+            probabilidades = self.analisador.analisar(tweet['texto'])
+            sentimento = mapear_sentimento(probabilidades)
+            sentimentos.append({
+                'data': tweet['data'].date(),
+                'ticker': ticker,
+                'sentimento': sentimento
+            })
+        return sentimentos
+    
+    def coletar_e_analisar_sentimento(self, ticker, quantidade=100):
+        tweets = self.coletar_tweets(ticker, quantidade)
+        sentimentos = []
+        for tweet in tweets:
+            sentimento = self.analisar_sentimento(tweet)
+            sentimentos.append({
+                'ticker': ticker,
+                'data': datetime.now().date(),
+                'sentimento': sentimento
+            })
+        return sentimentos
+        
+    def salvar_sentimentos(self, sentimentos):
+        if not sentimentos:
+            logger.warning("Nenhum sentimento para salvar")
+            return
+
+        try:
+            self.gerenciador_bd.upsert_dados('sentimento_mercado', sentimentos, ['data', 'ticker'])
+            logger.info(f"Sentimentos salvos com sucesso: {len(sentimentos)} registros")
+        except Exception as e:
+            logger.error(f"Erro ao salvar sentimentos: {str(e)}")
+
+
+    def analisar_sentimento(self, texto):
+        analise = TextBlob(texto)
+        return analise.sentiment.polarity
+
+    def inserir_dados_exemplo(self):
+        dados_exemplo = [
+            {'data': '2023-08-01', 'ticker': 'PETR4.SA', 'sentimento': 0.5},
+            {'data': '2023-08-02', 'ticker': 'PETR4.SA', 'sentimento': 0.3},
+            {'data': '2023-08-03', 'ticker': 'PETR4.SA', 'sentimento': 0.7},
+            {'data': '2023-08-01', 'ticker': 'VALE3.SA', 'sentimento': 0.6},
+            {'data': '2023-08-02', 'ticker': 'VALE3.SA', 'sentimento': 0.4},
+            {'data': '2023-08-03', 'ticker': 'VALE3.SA', 'sentimento': 0.8},
+            {'data': '2023-08-01', 'ticker': 'ITUB4.SA', 'sentimento': 0.2},
+            {'data': '2023-08-02', 'ticker': 'ITUB4.SA', 'sentimento': 0.5},
+            {'data': '2023-08-03', 'ticker': 'ITUB4.SA', 'sentimento': 0.6}
+        ]
+        self.salvar_sentimentos(dados_exemplo)
+
+if __name__ == '__main__':
+    coletor = ColetorSentimento()
+    coletor.inserir_dados_exemplo()
+    
+    # Verificar os dados inseridos
+    query = "SELECT * FROM sentimento_mercado ORDER BY data, ticker"
+    resultado = coletor.gerenciador_bd.executar_query(query)
+    print("Dados inseridos na tabela sentimento_mercado:")
+    print(resultado)
+
+File: app\coleta_dados\__init__.py
+------------------------
+
+File: app\coleta_dados\__pycache__\coletor_acoes.cpython-39.pyc
+------------------------
+a
+
+    £L¯f!	  ã                	   @   s’   d dl mZ d dlZd dlZd dlZd dlZej 	ej 	ej 	ej 
+e¡¡¡¡Zej 
+d e¡ d dlmZ G dd„ dƒZedkreƒ Ze ¡  dS )é    )Ú	timedeltaN)Ú
+GerenciadorBDc                   @   s@   e Zd Zdd„ Zdd„ Zddd„Zdd	„ Zd
+d„ Zdd
+d„ZdS )ÚColetorAcoesc                 C   s   t ƒ | _d S )N)r   Úgerenciador_bd©Úself© r   úLC:\Users\welli\OneDrive\Documentos\finaiti\app\coleta_dados\coletor_acoes.pyÚ__init__   s    zColetorAcoes.__init__c                 C   s   g d¢S )N)zPETR4.SAzVALE3.SAzITUB4.SAr   r   r   r   r	   Úobter_lista_acoes   s    zColetorAcoes.obter_lista_acoesÚ1yc                 C   s4   |   ¡ }|D ]"}t |¡j|d}|  ||¡ qd S )N©Úperiod)r   ÚyfÚTickerÚhistoryÚsalvar_dados_acao)r   ÚperiodoÚacoesÚacaoÚdadosr   r   r	   Úcoletar_dados_acoes   s    z ColetorAcoes.coletar_dados_acoesc                 C   s`   g }|  ¡ D ]:\}}| || ¡ |d |d |d |d |d dœ¡ q| j d|dd	g¡ d S )
+NÚOpenÚHighÚLowÚCloseÚVolume)r   ÚdataÚaberturaÚmaximaÚminimaÚ
+fechamentoÚvolumer   r   r   )ÚiterrowsÚappendÚdater   Úupsert_dados)r   r   r   Zdados_filtradosÚindexÚrowr   r   r	   r      s    ù
+	zColetorAcoes.salvar_dados_acaoc                 C   sh   |   ¡ }|D ]V}| j d|¡}|rD|tdd }t |¡j|d}nt |¡jdd}|  ||¡ qd S )Nr   é   )Údays)ÚstartÚmaxr
+   )r   r   Úobter_ultima_datar   r   r   r   r   )r   r   r   Úultima_dataÚ
+start_dater   r   r   r	   Úatualizar_dados_acoes*   s    z"ColetorAcoes.atualizar_dados_acoesÚ30dc                 C   s0   t  |¡j|d}|g d¢ jdddddœdS )	Nr
+   )r   r   r   r   r   r   r   r    r!   )r   r   r   r   )Úcolumns)r   r   r   Úrename)r   r   r   r   r   r   r	   Úobter_dados_historicos5   s    ÿz#ColetorAcoes.obter_dados_historicosN)r   )r1   )	Ú__name__Ú
+__module__Ú__qualname__r
+   r   r   r   r0   r4   r   r   r   r	   r   
+   s   
+r   Ú__main__)Údatetimer   ÚosÚsysZyfinancer   ÚpandasÚpdÚpathÚdirnameÚabspathÚ__file__Úprojeto_dirÚinsertÚbanco_dados.gerenciador_bdr   r   r5   Úcoletorr   r   r   r   r	   Ú<module>   s   $.
+
+File: app\coleta_dados\__pycache__\coletor_dados_economicos.cpython-39.pyc
+------------------------
+a
+
+    bK¯fõ  ã                	   @   sÈ   d dl m Z mZ d dlZd dlZd dlZd dlZd dlZd dl	m
+Z
+ d dlmZ d dl
+Z
+e
+ e¡Zej ej ej ej e¡¡¡¡Zej d e¡ d dlmZ G dd„ dƒZedkrÄeƒ Ze ¡  dS )	é    )ÚdatetimeÚ	timedeltaN)Ú	lru_cache)Úretry)Ú
+GerenciadorBDc                   @   sV   e Zd Zdd„ Zdd„ Zeddddd	d
+„ƒZeddddd„ƒZdd„ Z	dd„ Z
+dS )ÚColetorDadosEconomicosc                 C   s   t ƒ | _d| _t d¡ d S )NzChttps://api.bcb.gov.br/dados/serie/bcdata.sgs.{}/dados?formato=jsonz#ColetorDadosEconomicos inicializado)r   Úgerenciador_bdÚbase_urlÚloggerÚinfo)Úself© r
+   úWC:\Users\welli\OneDrive\Documentos\finaiti\app\coleta_dados\coletor_dados_economicos.pyÚ__init__   s    zColetorDadosEconomicos.__init__c                 C   s:   dddddœ}|  ¡ D ]\}}|  |¡}|  ||¡ qd S )Né  é±  é°  é   ©ZpibZinflacaoZselicZcambio)ÚitemsÚobter_dados_serieÚsalvar_dados_economicos)r   ÚseriesÚnomeÚcodigoÚdadosr
+   r
+   r   Úcoletar_dados_economicos   s    ü
+z/ColetorDadosEconomicos.coletar_dados_economicosé   iĞ  )Zstop_max_attempt_numberZ
+wait_fixedNc                 C   sD   | j  |¡}|r$|d| d¡› 7 }t |¡}| ¡  t | ¡ ¡S )Nú
+&dataInicial=ú%d/%m/%Y)	r	   ÚformatÚstrftimeÚrequestsÚgetÚraise_for_statusÚpdÚ	DataFrameÚjson)r   r   Údata_inicialÚurlÚresponser
+   r
+   r   r   &   s    
+z(ColetorDadosEconomicos.obter_dados_serieé    )Úmaxsizeé   c                 C   s:   t  ¡ t|d }| j |¡› d| d¡› }|  ||¡S )N©Údaysr   r   )r   Únowr   r	   r    r!   r   )r   r   ÚdiasZdata_inicior)   r
+   r
+   r   Úobter_dados_serie_cache/   s    z.ColetorDadosEconomicos.obter_dados_serie_cachec                 C   sR   |j sN||d< |jdddœdd | j d| d¡ddg¡ t d	|› d
+¡ d S )NÚ	indicadorÚdataÚvalor)r4   r5   T)ÚcolumnsÚinplaceÚdados_economicosÚrecordsu   Dados econÃ´micos para z atualizados com sucesso)ÚemptyÚrenamer   Úupsert_dadosÚto_dictr
+   r   )r   r   r   r
+   r
+   r   r   5   s
+    z.ColetorDadosEconomicos.salvar_dados_economicosc                 C   sn   dddddœ}|  ¡ D ]R\}}| j d|¡}|rL|tdd }|  ||¡}n
+|  |¡}|js|  ||¡ qd S )Nr   r   r   r   r   r8   r.   )r   r   Úobter_ultima_datar   r   r:   r   )r   r   r   r   Úultima_datar(   r   r
+   r
+   r   Úatualizar_dados_economicos<   s    ü
+z1ColetorDadosEconomicos.atualizar_dados_economicos)N)r-   )Ú__name__Ú
+__module__Ú__qualname__r   r   r   r   r   r2   r   r@   r
+   r
+   r
+   r   r      s   
+r   Ú__main__)r   r   ÚosÚsysÚyfinanceÚyfÚpandasr%   r"   Ú	functoolsr   Zretryingr   ÚloggingÚ	getLoggerrA   r
+   ÚpathÚdirnameÚabspathÚ__file__Úprojeto_dirÚinsertÚbanco_dados.gerenciador_bdr   r   Úcoletorr   r
+   r
+   r
+   r   Ú<module>   s    
+$<
+
+File: app\coleta_dados\__pycache__\coletor_fiis.cpython-39.pyc
+------------------------
+a
+
+    -8¯f÷  ã                	   @   s†   d dl Z d dlZd dlZd dlZe j e j e j e j e	¡¡¡¡Z
+ej d e
+¡ d dlm
+Z
+ G dd„ dƒZedkr‚eƒ Ze ¡  dS )é    N)Ú
+GerenciadorBDc                   @   s8   e Zd Zdd„ Zdd„ Zddd„Zdd	„ Zddd„Zd
+S )ÚColetorFIIsc                 C   s   t ƒ | _d S )N)r   Úgerenciador_bd©Úself© r   úKC:\Users\welli\OneDrive\Documentos\finaiti\app\coleta_dados\coletor_fiis.pyÚ__init__
+   s    zColetorFIIs.__init__c                 C   s   g d¢S )N)z	HGLG11.SAz	KNRI11.SAz	MXRF11.SAr   r   r   r   r   Úobter_lista_fiis   s    zColetorFIIs.obter_lista_fiisÚ1yc                 C   s4   |   ¡ }|D ]"}t |¡j|d}|  ||¡ qd S )N)Úperiod)r
+   ÚyfÚTickerÚhistoryÚsalvar_dados_fii)r   ÚperiodoÚfiisÚfiiÚdadosr   r   r   Úcoletar_dados_fiis   s    zColetorFIIs.coletar_dados_fiisc              	   C   s|   ||d< |j dd |jdddddd	d
+dœdd g d
+¢}|D ]}||jvr>d||< q>|| }| j d| d¡ddg¡ d S )Nr   T)ÚinplaceÚdataÚaberturaÚmaximaÚminimaÚ
+fechamentoÚvolumeÚ
+dividendos)ÚDateÚOpenÚHighÚLowÚCloseÚVolumeÚ	Dividends)Úcolumnsr   )r   r   r   r   r   r   r   r   r   r   Úrecords)Úreset_indexÚrenamer%   r   Úupsert_dadosÚto_dict)r   r   r   Zcolunas_necessariasÚcolunar   r   r   r      s&    ùø
+
+
+zColetorFIIs.salvar_dados_fiiÚ1dc                 C   sd   |   ¡ }|D ]R}| j dd|i¡jd d }|r|tjdd }t |¡j|d}|  	||¡ qd S )Nz+SELECT MAX(data) FROM fiis WHERE fii = :fiir   r   é   )Údays)Ústart)
+r
+   r   Úexecutar_queryÚilocÚpdÚ	Timedeltar
+   r   r   r   )r   r   r   r   Úultima_dataÚ
+start_dater   r   r   r   Úatualizar_dados_fiis1   s    şıız ColetorFIIs.atualizar_dados_fiisN)r   )r,   )Ú__name__Ú
+__module__Ú__qualname__r	   r
+   r   r   r6   r   r   r   r   r      s
+   
+r   Ú__main__)ÚosÚsysÚyfinancer
+   Úpandasr2   ÚpathÚdirnameÚabspathÚ__file__Úprojeto_dirÚinsertÚbanco_dados.gerenciador_bdr   r   r7   Úcoletorr   r   r   r   r   Ú<module>   s   $1
+
+File: app\coleta_dados\__pycache__\coletor_sentimento.cpython-39.pyc
+------------------------
+a
+
+    ´R¯fr  ã                	   @   s  d dl Z d dlZd dlmZ d dlZd dlmZmZ d dlZd dl	m
+Z
+ d dlmZ d dl
+Z
+e
+ e¡Ze j e j e j e j e¡¡¡¡Zej d e¡ d dlmZ d dlmZmZ e
+ƒ  G dd	„ d	ƒZed
+krşeƒ Ze ¡  dZej  e¡Z!e"dƒ e"e!ƒ dS )
+é    N)Úlogger)ÚdatetimeÚ	timedelta)Úload_dotenv)ÚTextBlob)Ú
+GerenciadorBD)ÚAnalisadorSentimentoÚmapear_sentimentoc                   @   sR   e Zd Zdd„ Zdd„ Zddd„Zddd	„Zddd„Zd
+d„ Zdd„ Z	dd„ Z
+dS )ÚColetorSentimentoc                 C   sH   t jt d¡t d¡t d¡t d¡t d¡d| _tƒ | _tƒ | _d S )NZTWITTER_BEARER_TOKENZTWITTER_API_KEYZTWITTER_API_SECRET_KEYZTWITTER_ACCESS_TOKENZTWITTER_ACCESS_TOKEN_SECRET)Zbearer_tokenZconsumer_keyZconsumer_secretZaccess_tokenZaccess_token_secret)	ÚtweepyÚClientÚosÚgetenvÚclientr   Úgerenciador_bdr   Ú
+analisador)Úself© r   úQC:\Users\welli\OneDrive\Documentos\finaiti\app\coleta_dados\coletor_sentimento.pyÚ__init__   s    ûzColetorSentimento.__init__c                 C   s\   t  d¡ |D ]>}| j d|¡}|d u s8|t ¡  ¡ k r|  |¡}|  |¡ qt  d¡ d S )Nu&   Iniciando atualizaÃ§Ã£o de sentimentosÚsentimento_mercadou'   AtualizaÃ§Ã£o de sentimentos concluÃ­da)	r   Úinfor   Úobter_ultima_datar   ÚnowÚdateÚcoletar_e_analisar_tweetsÚsalvar_sentimentos)r   ÚtickersÚtickerZultima_dataÚsentimentosr   r   r   Úatualizar_sentimentos"   s    
+
+z'ColetorSentimento.atualizar_sentimentosé   c              
+   C   sÌ   d|› d}t  ¡ t|d }g }zVtj| jj|dddgdjdd	D ]&}|j|k rX qn| 	|j|j
+d
+œ¡ qFt |¡W S  t
+yÆ } z6t d|› dt|ƒ› ¡ tjd
+dgdW  Y d }~S d }~0 0 d S )Nú$z -is:retweet lang:pt)Údayséd   Ú
+created_atÚtext)ÚqueryZmax_resultsZtweet_fieldsiè  )Úlimit)ÚdataÚtextozErro ao coletar tweets para z: r)   r*   )Úcolumns)r   r   r   r   Z	Paginatorr   Zsearch_recent_tweetsÚflattenr%   Úappendr&   ÚpdZ	DataFrameÚ	Exceptionr   ÚerrorÚstr)r   r   Údiasr'   Zdata_limiteÚtweetsÚtweetÚer   r   r   Úcoletar_tweets+   s$    
+ıı
+
+z ColetorSentimento.coletar_tweetsc           	      C   sX   |   ||¡}g }| ¡ D ]:\}}| j |d ¡}t|ƒ}| |d  ¡ ||dœ¡ q|S )Nr*   r)   ©r)   r   Ú
+sentimento)r6   Ziterrowsr   Zanalisarr	   r-   r   )	r   r   r2   Z	tweets_dfr   Ú_r4   Zprobabilidadesr8   r   r   r   r   >   s    
+ı
+z+ColetorSentimento.coletar_e_analisar_tweetsr$   c                 C   sB   |   ||¡}g }|D ](}|  |¡}| |t ¡  ¡ |dœ¡ q|S )N)r   r)   r8   )r6   Úanalisar_sentimentor-   r   r   r   )r   r   Z
+quantidader3   r   r4   r8   r   r   r   Úcoletar_e_analisar_sentimentoK   s    
+
+ı
+z/ColetorSentimento.coletar_e_analisar_sentimentoc              
+   C   s~   |st  d¡ d S z.| j d|ddg¡ t  dt|ƒ› d¡ W n8 tyx } z t  dt|ƒ› ¡ W Y d }~n
+d }~0 0 d S )NzNenhum sentimento para salvarr   r)   r   z Sentimentos salvos com sucesso: z
+ registroszErro ao salvar sentimentos: )	r   Úwarningr   Zupsert_dadosr   Úlenr/   r0   r1   )r   r   r5   r   r   r   r   W   s    
+z$ColetorSentimento.salvar_sentimentosc                 C   s   t |ƒ}|jjS )N)r   Z	sentimentZpolarity)r   r*   Zanaliser   r   r   r:   c   s    z%ColetorSentimento.analisar_sentimentoc                 C   sl   ddddœddddœddddœdd	d
+dœdd	ddœdd	ddœdd
+ddœdd
+ddœdd
+d
+dœg	}|   |¡ d S )Nz
+2023-08-01zPETR4.SAg      à?r7   z
+2023-08-02g333333Ó?z
+2023-08-03gffffffæ?zVALE3.SAg333333ã?gš™™™™™Ù?gš™™™™™é?zITUB4.SAgš™™™™™É?)r   )r   Z
+dados_exemplor   r   r   Úinserir_dados_exemplog   s    
+
+
+
+
+
+
+
+
+÷z'ColetorSentimento.inserir_dados_exemploN)r!   )r!   )r$   )Ú__name__Ú
+__module__Ú__qualname__r   r    r6   r   r;   r   r:   r>   r   r   r   r   r
+      s   	
+
+
+r
+   Ú__main__z6SELECT * FROM sentimento_mercado ORDER BY data, tickerz-Dados inseridos na tabela sentimento_mercado:)#r
+   ÚsysÚvenvr   Zpandasr.   r   r   r   Údotenvr   Ztextblobr   ÚloggingÚ	getLoggerr?   ÚpathÚdirnameÚabspathÚ__file__Zprojeto_dirÚinsertÚbanco_dados.gerenciador_bdr   Z*app.preprocessamento.analisador_sentimentor   r	   r
+   Zcoletorr>   r'   r   Úexecutar_queryÚ	resultadoÚprintr   r   r   r   Ú<module>   s,   
+$_
+
+File: app\coleta_dados\__pycache__\__init__.cpython-39.pyc
+------------------------
+a
+
+    ]H¬f    ã                   @   s   d S )N© r   r   r   úGC:\Users\welli\OneDrive\Documentos\finaiti\app\coleta_dados\__init__.pyÚ<module>   ó    
+
+File: app\modelo\kan.py
+------------------------
+import tensorflow as tf
+
+class KAN(tf.keras.Model):
+    def __init__(self, input_dim, output_dim, num_splines=10):
+        super(KAN, self).__init__()
+        self.input_layer = tf.keras.layers.Input(shape=(None, input_dim))
+        self.lstm_layer = tf.keras.layers.LSTM(num_splines, return_sequences=True)
+        self.spline_activations = [SplineActivation() for _ in range(num_splines)]
+        self.output_layer = tf.keras.layers.Dense(output_dim)
+
+    def call(self, inputs):
+        x = self.lstm_layer(inputs)
+        x = tf.stack([activation(x[:, :, i]) for i, activation in enumerate(self.spline_activations)], axis=-1)
+        return self.output_layer(x[:, -1, :])  # Use apenas o Ãºltimo passo de tempo
+
+    def build(self, input_shape):
+        super(KAN, self).build(input_shape)
+        self.built = True
+    
+class SplineActivation(tf.keras.layers.Layer):
+    def __init__(self, num_knots=5, order=3):
+        super().__init__()
+        self.num_knots = num_knots
+        self.order = order
+
+    def build(self, input_shape):
+        self.knots = self.add_weight(
+            name="knots",
+            shape=(self.num_knots,),
+            initializer="random_normal",
+            trainable=True
+        )
+        self.coeffs = self.add_weight(
+            name="coeffs",
+            shape=(self.num_knots + self.order - 1,),
+            initializer="random_normal",
+            trainable=True
+        )
+
+    def call(self, inputs):
+        return self.evaluate_spline(inputs)
+
+    def evaluate_spline(self, x):
+        # ImplementaÃ§Ã£o simplificada da avaliaÃ§Ã£o do spline
+        y = tf.zeros_like(x)
+        for i in range(self.num_knots):
+            mask = tf.cast(x > self.knots[i], tf.float32)
+            y += self.coeffs[i] * mask * tf.pow(x - self.knots[i], self.order)
+        return y
+
+File: app\modelo\treinador.py
+------------------------
+import os
+import sys
+from venv import logger
+
+# Adiciona o diretÃ³rio raiz do projeto ao sys.path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, project_root)
+
+import sqlalchemy
+import tensorflow as tf
+import numpy as np
+import pandas as pd
+from keras.callbacks import EarlyStopping
+from banco_dados.gerenciador_bd import GerenciadorBD
+from app.modelo.kan import KAN, SplineActivation
+from app.coleta_dados.coletor_sentimento import ColetorSentimento
+from app.preprocessamento.analisador_sentimento import AnalisadorSentimento
+
+class TreinadorKAN:
+    def __init__(self, output_dim, num_splines=10):
+        self.output_dim = output_dim
+        self.num_splines = num_splines
+        self.model = None
+        self.optimizer = tf.keras.optimizers.Adam()
+        self.loss_fn = tf.keras.losses.MeanSquaredError()
+        self.gerenciador_bd = GerenciadorBD()
+        self.input_dim = None
+        self.coletor_sentimento = ColetorSentimento()
+        self.analisador_sentimento = AnalisadorSentimento()
+
+    def criar_modelo(self, input_dim):
+        logger.debug(f"Criando modelo com input_dim: {input_dim}")
+        self.input_dim = input_dim
+        self.model = KAN(input_dim, self.output_dim, self.num_splines)
+        dummy_input = tf.keras.Input(shape=(None, input_dim) if input_dim > 1 else (None, 1))
+        self.model(dummy_input)  # This will build the model
+        self.model.compile(optimizer=self.optimizer, loss=self.loss_fn)
+
+    def preparar_dados(self, tabela, ticker=None, janela_tempo=30, horizonte_previsao=1):
+        if tabela == 'dados_economicos':
+            return self.preparar_dados_economicos(tabela, janela_tempo, horizonte_previsao)
+        
+        try:
+            query = f"""
+                SELECT DISTINCT ON (n.data) n.data, n.abertura, n.maxima, n.minima, n.fechamento, n.volume, COALESCE(s.sentimento, 0) as sentimento
+                FROM {tabela}_normalizados n
+                LEFT JOIN sentimento_mercado s ON n.data = s.data AND n.{'acao' if tabela == 'acoes' else 'fii'} = s.ticker
+                WHERE n.{'acao' if tabela == 'acoes' else 'fii'} = :ticker
+                ORDER BY n.data DESC
+                LIMIT 1000
+            """
+            dados = self.gerenciador_bd.executar_query(query, {'ticker': ticker})
+            
+            if dados.empty:
+                logger.warning(f"Nenhum dado encontrado para {ticker}")
+                return None, None
+
+            # Remover colunas desnecessÃ¡rias
+            colunas_para_remover = ['id', 'acao', 'fii']
+            dados = dados.drop(columns=[col for col in colunas_para_remover if col in dados.columns])
+            
+            # Converter todas as colunas para float32, exceto 'data'
+            for col in dados.columns:
+                if col != 'data':
+                    dados[col] = dados[col].astype('float32')
+            
+            # Remover linhas com valores nulos
+            dados = dados.dropna()
+            
+            logger.debug(f"Preparando dados para {ticker}: {dados.shape}")
+            logger.debug(f"Colunas dos dados: {dados.columns}")
+            logger.debug(f"Primeiras linhas dos dados:\n{dados.head()}")
+            
+            X, y = [], []
+            for i in range(len(dados) - janela_tempo - horizonte_previsao + 1):
+                X.append(dados.iloc[i:i+janela_tempo].drop('data', axis=1).values)
+                y.append(dados.iloc[i+janela_tempo+horizonte_previsao-1]['fechamento'])
+            
+            return np.array(X), np.array(y)
+        
+        except Exception as e:
+            logger.error(f"Erro ao preparar dados para {ticker}: {str(e)}", exc_info=True)
+            return None, None
+
+    def salvar_modelo(self, nome_modelo):
+        try:
+            modelo_serializado = self.model.to_json()
+            pesos = self.model.get_weights()
+            self.gerenciador_bd.salvar_modelo(nome_modelo, modelo_serializado, pesos)
+            logger.info(f"Modelo {nome_modelo} salvo com sucesso no banco de dados")
+        except sqlalchemy.exc.ProgrammingError as e:
+            if "nÃ£o existe a relaÃ§Ã£o" in str(e):
+                logger.warning("Tabela modelos_treinados nÃ£o existe. Criando...")
+                self.gerenciador_bd.criar_tabela_modelos()
+                self.gerenciador_bd.salvar_modelo(nome_modelo, modelo_serializado, pesos)
+                logger.info(f"Modelo {nome_modelo} salvo com sucesso apÃ³s criar a tabela")
+            else:
+                raise
+
+    def carregar_modelo(self, tabela):
+        nome_modelo = f"modelo_{tabela}"
+        try:
+            modelo_json, pesos = self.gerenciador_bd.carregar_modelo(nome_modelo)
+            if modelo_json and pesos:
+                self.model = tf.keras.models.model_from_json(modelo_json, custom_objects={'KAN': KAN, 'SplineActivation': SplineActivation})
+                self.model.set_weights(pesos)
+                logger.info(f"Modelo para {tabela} carregado com sucesso")
+            else:
+                logger.warning(f"Nenhum modelo encontrado para {tabela}")
+        except Exception as e:
+            logger.error(f"Erro ao carregar modelo para {tabela}: {str(e)}", exc_info=True)
+
+    def preparar_dados_economicos(self, tabela):
+        dados = self.gerenciador_bd.obter_dados(f"{tabela}_normalizados")
+        if dados.empty:
+            return None, None
+
+        # Assumindo que queremos prever o prÃ³ximo valor com base nos Ãºltimos 30 dias
+        janela_tempo = 30
+        X, y = [], []
+        for i in range(len(dados) - janela_tempo):
+            X.append(dados['valor'].iloc[i:i+janela_tempo].values)
+            y.append(dados['valor'].iloc[i+janela_tempo])
+
+        return np.array(X), np.array(y)
+    
+    def preparar_dados_sentimento(self, tabela):
+        dados = self.gerenciador_bd.obter_dados(f"{tabela}_normalizados")
+        if dados.empty:
+            return None, None
+
+        # Assumindo que queremos prever o sentimento do prÃ³ximo dia com base nos Ãºltimos 7 dias
+        janela_tempo = 7
+        X, y = [], []
+        for ticker in dados['ticker'].unique():
+            dados_ticker = dados[dados['ticker'] == ticker].sort_values('data')
+            for i in range(len(dados_ticker) - janela_tempo):
+                X.append(dados_ticker['sentimento'].iloc[i:i+janela_tempo].values)
+                y.append(dados_ticker['sentimento'].iloc[i+janela_tempo])
+
+        return np.array(X), np.array(y)
+
+    def prever(self, X, dias):
+        if self.model is None:
+            raise ValueError("Modelo nÃ£o treinado. Por favor, treine o modelo primeiro.")
+
+        previsoes = []
+        ultimo_valor_real = X[0, -1, 3]  # Ãšltimo valor de fechamento
+        for _ in range(dias):
+            previsao = self.model.predict(X)
+            previsao_suavizada = 0.7 * previsao[0, 0] + 0.3 * ultimo_valor_real  # Fator de suavizaÃ§Ã£o
+            previsoes.append(previsao_suavizada)
+            X = np.roll(X, -1, axis=1)
+            X[0, -1, :] = previsao
+            ultimo_valor_real = previsao_suavizada
+
+        return np.array(previsoes)
+
+    def treinar(self, tabela, epocas=100, batch_size=32):
+        logger.debug(f"Iniciando treinamento para tabela: {tabela}")
+        try:
+            if tabela == 'dados_economicos':
+                X, y = self.preparar_dados_economicos(tabela)
+            elif tabela == 'sentimento_mercado':
+                X, y = self.preparar_dados_sentimento(tabela)
+            else:
+                # CÃ³digo existente para aÃ§Ãµes e FIIs
+                tickers_df = self.gerenciador_bd.executar_query(f"SELECT DISTINCT {'acao' if tabela == 'acoes' else 'fii'} FROM {tabela}_normalizados")
+                tickers = tickers_df[tickers_df.columns[0]].tolist()
+                logger.debug(f"Lista de tickers: {tickers}")
+
+                X_all, y_all = [], []
+                for ticker in tickers:
+                    X, y = self.preparar_dados(tabela, ticker)
+                    if X is not None and y is not None:
+                        X_all.extend(X)
+                        y_all.extend(y)
+                X, y = np.array(X_all), np.array(y_all)
+
+            if X is None or y is None or len(X) == 0 or len(y) == 0:
+                logger.warning(f"NÃ£o hÃ¡ dados suficientes para treinar o modelo para {tabela}")
+                return
+
+            if self.model is None:
+                input_dim = X.shape[2] if len(X.shape) > 2 else 1
+                self.criar_modelo(input_dim)
+
+            history = self.model.fit(
+                X, y,
+                epochs=epocas,
+                batch_size=batch_size,
+                validation_split=0.2,
+                verbose=1
+            )
+
+            # Salvar o modelo treinado
+            nome_modelo = f"modelo_{tabela}"
+            self.salvar_modelo(nome_modelo)
+
+            logger.debug("Treinamento concluÃ­do com sucesso e modelo salvo")
+            return history
+        except Exception as e:
+            logger.error(f"Erro durante o treinamento: {str(e)}", exc_info=True)
+            raise
+
+    def avaliar(self, tabela):
+        X, y = self.preparar_dados(tabela)
+        
+        if len(X) == 0 or len(y) == 0:
+            print(f"NÃ£o hÃ¡ dados suficientes para avaliar o modelo para {tabela}")
+            return
+        
+        if self.model is None:
+            raise ValueError("Modelo nÃ£o treinado. Por favor, treine o modelo primeiro.")
+        
+        loss = self.model.evaluate(X, y)
+        print(f'Erro QuadrÃ¡tico MÃ©dio: {loss:.4f}')
+
+    def validar_previsoes(self, previsoes, ultimos_valores_reais):
+        variacao_maxima_diaria = max(ultimos_valores_reais) * 0.05  # 5% de variaÃ§Ã£o mÃ¡xima diÃ¡ria
+        ultimo_valor_real = ultimos_valores_reais[-1]
+        previsoes_validadas = []
+        for i, previsao in enumerate(previsoes):
+            variacao = previsao - ultimo_valor_real
+            if abs(variacao) > variacao_maxima_diaria:
+                logger.warning(f"PrevisÃ£o {i+1} ({previsao:.2f}) parece estar fora da faixa esperada.")
+                # Ajustar a previsÃ£o para estar dentro da faixa aceitÃ¡vel
+                if variacao > 0:
+                    previsao = ultimo_valor_real + variacao_maxima_diaria
+                else:
+                    previsao = ultimo_valor_real - variacao_maxima_diaria
+            previsoes_validadas.append(previsao)
+            ultimo_valor_real = previsao  # Atualiza o Ãºltimo valor para a prÃ³xima iteraÃ§Ã£o
+        return previsoes_validadas
+
+if __name__ == '__main__':
+    treinador = TreinadorKAN(output_dim=1, num_splines=10)
+    for tabela in ['acoes', 'fiis']:
+        print(f'Treinando modelo para {tabela}:')
+        treinador.treinar(tabela)
+        print(f'Avaliando modelo para {tabela}:')
+        treinador.avaliar(tabela)
+
+File: app\modelo\__init__.py
+------------------------
+
+File: app\modelo\__pycache__\kan.cpython-39.pyc
+------------------------
+a
+
+    -n®fE  ã                   @   s6   d dl ZG dd„ dejjƒZG dd„ dejjjƒZdS )é    Nc                       s2   e Zd Zd‡ fdd„	Zdd„ Z‡ fdd„Z‡  ZS )	ÚKANé
+   c                    s`   t t| ƒ ¡  tjjjd |fd| _tjjj|dd| _	dd„ t
+|ƒD ƒ| _tjj |¡| _
+d S )N)ÚshapeT)Úreturn_sequencesc                 S   s   g | ]
+}t ƒ ‘qS © )ÚSplineActivation)Ú.0Ú_r   r   ú<C:\Users\welli\OneDrive\Documentos\finaiti\app\modelo\kan.pyÚ
+<listcomp>   ó    z KAN.__init__.<locals>.<listcomp>)Úsuperr   Ú__init__ÚtfÚkerasÚlayersÚInputÚinput_layerÚLSTMÚ
+lstm_layerÚrangeÚspline_activationsÚDenseÚoutput_layer)ÚselfÚ	input_dimÚ
+output_dimÚnum_splines©Ú	__class__r   r
+   r      s
+    zKAN.__init__c                    sH   |   |¡‰ tj‡ fdd„t| jƒD ƒdd‰ |  ˆ d d …dd d …f ¡S )Nc                    s*   g | ]"\}}|ˆ d d …d d …|f ƒ‘qS ©Nr   )r   ÚiÚ
+activation©Úxr   r
+   r   
+   r   zKAN.call.<locals>.<listcomp>éÿÿÿÿ)Úaxis)r   r   ÚstackÚ	enumerater   r   ©r   Úinputsr   r#   r
+   Úcall   s    
+"zKAN.callc                    s   t t| ƒ |¡ d| _d S )NT)r
+   r   ÚbuildÚbuilt©r   Úinput_shaper   r   r
+   r,      s    z	KAN.build)r   )Ú__name__Ú
+__module__Ú__qualname__r   r+   r,   Ú
+__classcell__r   r   r   r
+   r      s   r   c                       s6   e Zd Zd‡ fdd„	Zdd„ Zdd„ Zd	d
+„ Z‡  ZS )r   é   é   c                    s   t ƒ  ¡  || _|| _d S r    )r
+   r   Ú	num_knotsÚorder)r   r6   r7   r   r   r
+   r      s    
+zSplineActivation.__init__c                 C   s>   | j d| jfddd| _| j d| j| j d fddd| _d S )NÚknotsÚ
+random_normalT)Únamer   ÚinitializerÚ	trainableÚcoeffsé   )Ú
+add_weightr6   r8   r7   r=   r.   r   r   r
+   r,      s    üüzSplineActivation.buildc                 C   s
+   |   |¡S r    )Úevaluate_spliner)   r   r   r
+   r+   (   s    zSplineActivation.callc                 C   s`   t  |¡}t| jƒD ]F}t  || j| kt j¡}|| j| | t  || j|  | j	¡ 7 }q|S r    )
+r   Ú
+zeros_liker   r6   Úcastr8   Úfloat32r=   Úpowr7   )r   r$   Úyr!   Úmaskr   r   r
+   r@   +   s
+    
+,z SplineActivation.evaluate_spline)r4   r5   )r0   r1   r2   r   r,   r+   r@   r3   r   r   r   r
+   r      s   r   )Ú
+tensorflowr   r   ÚModelr   r   ÚLayerr   r   r   r   r
+   Ú<module>   s   
+
+File: app\modelo\__pycache__\treinador.cpython-39.pyc
+------------------------
+a
+
+    ‹G¯f+  ã                   @   s  d dl Z d dlZd dlmZ e j e j e j e¡dd¡¡Z	ej 
+d e	¡ d dlZd dlZ
+d dlZd dlZd dlmZ d dlmZ d dlmZmZ d dlmZ d dlmZ G d	d
+„ d
+ƒZedkredd
+dZdD ]8Z e!de › dƒ e "e ¡ e!de › dƒ e #e ¡ qÒdS )é    N)Úloggerz..)Ú
+EarlyStopping)Ú
+GerenciadorBD©ÚKANÚSplineActivation)ÚColetorSentimento)ÚAnalisadorSentimentoc                   @   sj   e Zd Zddd„Zdd„ Zdd	d
+„Zdd„ Zd
+d„ Zdd„ Zdd„ Z	dd„ Z
+ddd„Zdd„ Zdd„ Z
+dS ) ÚTreinadorKANé
+   c                 C   sP   || _ || _d | _tjj ¡ | _tjj 	¡ | _
+tƒ | _d | _
+tƒ | _tƒ | _d S )N)Ú
+output_dimÚnum_splinesÚmodelÚtfÚkerasZ
+optimizersÚAdamÚ	optimizerÚlossesZMeanSquaredErrorÚloss_fnr   Úgerenciador_bdÚ	input_dimr   Úcoletor_sentimentor	   Úanalisador_sentimento)Úselfr   r
+   © r   úBC:\Users\welli\OneDrive\Documentos\finaiti\app\modelo\treinador.pyÚ__init__   s    zTreinadorKAN.__init__c                 C   sh   t  d|› ¡ || _t|| j| jƒ| _tjj	|dkr>d |fndd}|  |¡ | jj
+| j| jd d S )NzCriando modelo com input_dim: é   )Nr   )Úshape)r   Úloss)
+r   Údebugr   r   r   r
+   r   r   r   ÚInputÚcompiler   r   )r   r   Zdummy_inputr   r   r   Úcriar_modelo   s    
+zTreinadorKAN.criar_modeloNé   r   c              
+      sÔ  |dkr|   |||¡S zpd|› d|dkr.dnd› d|dkr@dnd› d}| j |d	|i¡‰ ˆ jrxt d
+|› ¡ W dS g d¢}ˆ j‡ fd
+d„|D ƒd‰ ˆ jD ]}|dkr ˆ |  d¡ˆ |< q ˆ  	¡ ‰ t 
+d|› dˆ j› ¡ t 
+dˆ j› ¡ t 
+dˆ  ¡ › ¡ g g  }}	t
+tˆ ƒ| | d ƒD ]J}
+| ˆ j|
+|
+| … jdddj¡ |	 ˆ j|
+| | d  d ¡ q(t |¡t |	¡fW S  tyÎ } z,tjd|› dt|ƒ› dd W Y d }~dS d }~0 0 d S )NÚdados_economicoszª
+                SELECT DISTINCT ON (n.data) n.data, n.abertura, n.maxima, n.minima, n.fechamento, n.volume, COALESCE(s.sentimento, 0) as sentimento
+                FROM zX_normalizados n
+                LEFT JOIN sentimento_mercado s ON n.data = s.data AND n.ÚacoesÚacaoÚfiiz$ = s.ticker
+                WHERE n.zW = :ticker
+                ORDER BY n.data DESC
+                LIMIT 1000
+            ÚtickerzNenhum dado encontrado para ©NN)Úidr'   r(   c                    s   g | ]}|ˆ j v r|‘qS r   ©Úcolumns)Ú.0Úcol©Údadosr   r   Ú
+<listcomp><   ó    z/TreinadorKAN.preparar_dados.<locals>.<listcomp>r,   ÚdataÚfloat32zPreparando dados para ú: zColunas dos dados: zPrimeiras linhas dos dados:
+r   ©ÚaxisÚ
+fechamentozErro ao preparar dados para T©Úexc_info)Úpreparar_dados_economicosr   Úexecutar_queryÚemptyr   ÚwarningÚdropr-   ÚastypeÚdropnar    r   ÚheadÚrangeÚlenÚappendÚilocÚvaluesÚnpÚarrayÚ	ExceptionÚerrorÚstr)r   Útabelar)   Újanela_tempoZhorizonte_previsaoÚqueryZcolunas_para_removerr/   ÚXÚyÚiÚer   r0   r   Úpreparar_dados'   s>    şıü
+
+$$zTreinadorKAN.preparar_dadosc              
+   C   s®   z:| j  ¡ }| j  ¡ }| j |||¡ t d|› d¡ W nn tjj	y¨ } zRdt
+|ƒv r’t d¡ | j ¡  | j |||¡ t d|› d¡ n‚ W Y d }~n
+d }~0 0 d S )NzModelo z$ salvo com sucesso no banco de dadosu   nÃ£o existe a relaÃ§Ã£ou0   Tabela modelos_treinados nÃ£o existe. Criando...u'    salvo com sucesso apÃ³s criar a tabela)
+r   Úto_jsonZget_weightsr   Ú
+salvar_modelor   ÚinfoÚ
+sqlalchemyÚexcÚProgrammingErrorrM   r?   Úcriar_tabela_modelos)r   Únome_modeloZmodelo_serializadoÚpesosrT   r   r   r   rW   U   s    
+
+
+
+zTreinadorKAN.salvar_modeloc              
+   C   s¸   d|› }zf| j  |¡\}}|r^|r^tjjj|ttdœd| _| j 	|¡ t
+ d|› d¡ nt
+ d|› ¡ W nB t
+y² } z*t
+jd|› dt|ƒ› d	d
+ W Y d }~n
+d }~0 0 d S )NÚmodelo_r   )Zcustom_objectszModelo para z carregado com sucessozNenhum modelo encontrado para zErro ao carregar modelo para r6   Tr:   )r   Úcarregar_modelor   r   ÚmodelsZmodel_from_jsonr   r   r   Úset_weightsr   rX   r?   rK   rL   rM   )r   rN   r]   Úmodelo_jsonr^   rT   r   r   r   r`   d   s    
+zTreinadorKAN.carregar_modeloc                 C   sŠ   | j  |› d¡}|jrdS d}g g  }}tt|ƒ| ƒD ]:}| |d j||| … j¡ | |d j||  ¡ q:t 	|¡t 	|¡fS )NÚ
+_normalizadosr*   r$   Úvalor)
+r   Úobter_dadosr>   rD   rE   rF   rG   rH   rI   rJ   )r   rN   r1   rO   rQ   rR   rS   r   r   r   r<   q   s    
+z&TreinadorKAN.preparar_dados_economicosc           	      C   s²   | j  |› d¡}|jrdS d}g g  }}|d  ¡ D ]f}||d |k  d¡}tt|ƒ| ƒD ]:}| |d j||| … j	¡ | |d j||  ¡ q`q6t
+ |¡t
+ |¡fS )Nrd   r*   é   r)   r4   Ú
+sentimento)r   rf   r>   ÚuniqueÚsort_valuesrD   rE   rF   rG   rH   rI   rJ   )	r   rN   r1   rO   rQ   rR   r)   Zdados_tickerrS   r   r   r   Úpreparar_dados_sentimento   s    
+z&TreinadorKAN.preparar_dados_sentimentoc                 C   s†   | j d u rtdƒ‚g }|d }t|ƒD ]T}| j  |¡}d|d  d|  }| |¡ tj|ddd}||d	dd d …f< |}q&t |¡S )
+Nõ:   Modelo nÃ£o treinado. Por favor, treine o modelo primeiro.)r   éÿÿÿÿé   gffffffæ?)r   r   g333333Ó?rm   r   r7   r   )r   Ú
+ValueErrorrD   ÚpredictrF   rI   ÚrollrJ   )r   rQ   ÚdiasÚ	previsoesÚultimo_valor_realÚ_ÚprevisaoZprevisao_suavizadar   r   r   Úprever   s    
+
+zTreinadorKAN.preveréd   é    c              
+   C   sä  t  d|› ¡ zŒ|dkr,|  |¡\}}n¾|dkrD|  |¡\}}n¦| j d|dkrXdnd› d|› d	¡}||jd
+   ¡ }t  d|› ¡ g g  }}	|D ]8}
+|  ||
+¡\}}|d urš|d urš| 	|¡ |	 	|¡ qšt
+ |¡t
+ |	¡ }}|d u s|d u st|ƒd
+kst|ƒd
+kr0t  
+d|› ¡ W d S | jd u rdt|jƒd
+krV|jd
+ nd}|  |¡ | jj||||ddd}d|› }
+|  |
+¡ t  d¡ |W S  tyŞ } z&t jdt|ƒ› dd ‚ W Y d }~n
+d }~0 0 d S )Nz#Iniciando treinamento para tabela: r%   Úsentimento_mercadozSELECT DISTINCT r&   r'   r(   z FROM rd   r   zLista de tickers: u6   NÃ£o hÃ¡ dados suficientes para treinar o modelo para é   r   gš™™™™™É?)ÚepochsÚ
+batch_sizeZvalidation_splitÚverboser_   u1   Treinamento concluÃ­do com sucesso e modelo salvozErro durante o treinamento: Tr:   )r   r    r<   rk   r   r=   r-   ÚtolistrU   ÚextendrI   rJ   rE   r?   r   r   r#   ÚfitrW   rK   rL   rM   )r   rN   Zepocasr}   rQ   rR   Z
+tickers_dfÚtickersZX_allÚy_allr)   r   Úhistoryr]   rT   r   r   r   ÚtreinarŸ   sH    &
+
+0
+û	
+
+
+zTreinadorKAN.treinarc                 C   sl   |   |¡\}}t|ƒdks&t|ƒdkr8td|› ƒ d S | jd u rJtdƒ‚| j ||¡}td|d›ƒ d S )Nr   u6   NÃ£o hÃ¡ dados suficientes para avaliar o modelo para rl   u   Erro QuadrÃ¡tico MÃ©dio: z.4f)rU   rE   Úprintr   ro   Úevaluate)r   rN   rQ   rR   r   r   r   r   ÚavaliarÎ   s    
+zTreinadorKAN.avaliarc           	      C   sˆ   t |ƒd }|d }g }t|ƒD ]b\}}|| }t|ƒ|krtt d|d › d|d›d¡ |dkrl|| }n|| }| |¡ |}q |S )	Ngš™™™™™©?rm   u
+   PrevisÃ£o r   z (z.2fz&) parece estar fora da faixa esperada.r   )ÚmaxÚ	enumerateÚabsr   r?   rF   )	r   rs   Úultimos_valores_reaisZvariacao_maxima_diariart   Úprevisoes_validadasrS   rv   Zvariacaor   r   r   Úvalidar_previsoesÛ   s    
+
+zTreinadorKAN.validar_previsoes)r   )Nr$   r   )rx   ry   )Ú__name__Ú
+__module__Ú__qualname__r   r#   rU   rW   r`   r<   rk   rw   r…   rˆ   r   r   r   r   r   r
+      s   
+
+.
+
+/
+r
+   Ú__main__r   r   )r   r
+   )r&   ÚfiiszTreinando modelo para ú:zAvaliando modelo para )$ÚosÚsysÚvenvr   ÚpathÚabspathÚjoinÚdirnameÚ__file__Úproject_rootÚinsertrY   Ú
+tensorflowr   ÚnumpyrI   ÚpandasÚpdZkeras.callbacksr   Úbanco_dados.gerenciador_bdr   Zapp.modelo.kanr   r   Ú#app.coleta_dados.coletor_sentimentor   Ú*app.preprocessamento.analisador_sentimentor	   r
+   r   Ú	treinadorrN   r†   r…   rˆ   r   r   r   r   Ú<module>   s,     Z
+
+
+
+File: app\modelo\__pycache__\__init__.cpython-39.pyc
+------------------------
+a
+
+    ]H¬f    ã                   @   s   d S )N© r   r   r   úAC:\Users\welli\OneDrive\Documentos\finaiti\app\modelo\__init__.pyÚ<module>   ó    
+
+File: app\preprocessamento\analisador_sentimento.py
+------------------------
+from textblob import TextBlob
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+import pandas as pd
+import re
+
+class AnalisadorSentimento:
+    def __init__(self):
+        self.tokenizer = AutoTokenizer.from_pretrained("neuralmind/bert-base-portuguese-cased")
+        self.model = AutoModelForSequenceClassification.from_pretrained("neuralmind/bert-base-portuguese-cased")
+
+    def analisar(self, texto):
+        inputs = self.tokenizer(texto, return_tensors="pt", truncation=True, padding=True, max_length=512)
+        outputs = self.model(**inputs)
+        probabilities = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        return probabilities[0].tolist()
+
+    def limpar_texto(self, texto):
+        texto = re.sub(r'http\S+', '', texto)  # remove URLs
+        texto = re.sub(r'@\w+', '', texto)     # remove menÃ§Ãµes
+        texto = re.sub(r'#\w+', '', texto)     # remove hashtags
+        return texto.strip()
+
+    def analisar_sentimento(self, texto):
+        texto_limpo = self.limpar_texto(texto)
+        analise = TextBlob(texto_limpo)
+        return analise.sentiment.polarity
+
+    def analisar_tweets(self, df):
+        df['sentimento'] = df['texto'].apply(self.analisar_sentimento)
+        return df
+    
+# FunÃ§Ã£o para mapear as probabilidades para um valor de sentimento entre -1 e 1
+def mapear_sentimento(probabilidades):
+    return (probabilidades[1] - probabilidades[0]) * 2 - 1
+
+File: app\preprocessamento\limpeza_dados.py
+------------------------
+import pandas as pd
+import numpy as np
+import os
+import sys
+
+# Adiciona o diretÃ³rio raiz do projeto ao sys.path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, project_root)
+
+from banco_dados.gerenciador_bd import GerenciadorBD
+
+class LimpadorDados:
+    def __init__(self):
+        self.gerenciador_bd = GerenciadorBD()
+
+    def limpar_dados(self, tabela):
+        try:
+            dados = self.gerenciador_bd.obter_dados(tabela)
+            if dados.empty:
+                print(f"Aviso: NÃ£o hÃ¡ dados na tabela {tabela}")
+                return pd.DataFrame()
+            dados_limpos = self.remover_valores_ausentes(dados)
+            dados_limpos = self.tratar_outliers(dados_limpos)
+            return dados_limpos
+        except Exception as e:
+            print(f"Erro ao limpar dados da tabela {tabela}: {str(e)}")
+            return pd.DataFrame()
+
+    def remover_valores_ausentes(self, dados):
+        return dados.dropna()
+
+    def tratar_outliers(self, dados):
+        for coluna in dados.select_dtypes(include=[np.number]).columns:
+            q1 = dados[coluna].quantile(0.25)
+            q3 = dados[coluna].quantile(0.75)
+            iqr = q3 - q1
+            limite_inferior = q1 - 1.5 * iqr
+            limite_superior = q3 + 1.5 * iqr
+            dados[coluna] = dados[coluna].clip(limite_inferior, limite_superior)
+        return dados
+
+if __name__ == '__main__':
+    limpador = LimpadorDados()
+    for tabela in ['acoes', 'fiis', 'dados_economicos']:
+        dados_limpos = limpador.limpar_dados(tabela)
+        if not dados_limpos.empty:
+            print(f"Dados da tabela {tabela} limpos com sucesso.")
+        else:
+            print(f"NÃ£o foi possÃ­vel limpar os dados da tabela {tabela}.")
+
+File: app\preprocessamento\normalizacao.py
+------------------------
+from venv import logger
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+import os
+import sys
+import joblib
+
+# Adiciona o diretÃ³rio raiz do projeto ao sys.path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, project_root)
+
+from banco_dados.gerenciador_bd import GerenciadorBD
+
+class Normalizador:
+    def __init__(self):
+        self.gerenciador_bd = GerenciadorBD()
+        self.scalers = {}
+
+    def obter_min_max(self, coluna, tabela):
+        if coluna not in self.scalers:
+            raise ValueError(f"Scaler nÃ£o encontrado para a coluna {coluna}")
+        scaler = self.scalers[coluna]
+        return scaler.data_min_[0], scaler.data_max_[0]
+
+    def normalizar_dados(self, tabela):
+        dados = self.gerenciador_bd.obter_dados(tabela)
+        if dados.empty:
+            logger.warning(f"NÃ£o hÃ¡ dados para normalizar na tabela {tabela}")
+            return None
+        
+        # LÃ³gica de normalizaÃ§Ã£o especÃ­fica para cada tipo de dado
+        if tabela == 'acoes' or tabela == 'fiis':
+            colunas_para_normalizar = ['abertura', 'maxima', 'minima', 'fechamento', 'volume']
+        elif tabela == 'dados_economicos':
+            colunas_para_normalizar = ['valor']
+        elif tabela == 'sentimento_mercado':
+            colunas_para_normalizar = ['sentimento']
+        else:
+            logger.error(f"Tabela nÃ£o reconhecida: {tabela}")
+            return None
+        
+        dados_normalizados = dados.copy()
+        for coluna in colunas_para_normalizar:
+            dados_normalizados[coluna] = self.scaler.fit_transform(dados[[coluna]])
+        
+        return dados_normalizados
+
+    def salvar_dados_normalizados(self, tabela, dados_normalizados):
+        if not dados_normalizados.empty:
+            try:
+                # Usar SQLAlchemy para salvar os dados
+                dados_normalizados.to_sql(f'{tabela}_normalizados', self.gerenciador_bd.engine, if_exists='replace', index=False)
+                print(f"Dados normalizados da tabela {tabela} salvos com sucesso.")
+            except Exception as e:
+                print(f"Erro ao salvar dados normalizados da tabela {tabela}: {str(e)}")
+        else:
+            print(f"NÃ£o hÃ¡ dados normalizados para salvar da tabela {tabela}.")
+
+    def desnormalizar_valor(self, valor_normalizado, coluna, tabela):
+        if coluna not in self.scalers:
+            self.carregar_scalers(tabela)
+        min_val, max_val = self.obter_min_max(coluna, tabela)
+        if isinstance(valor_normalizado, np.ndarray):
+            valor_normalizado = np.clip(valor_normalizado, 0, 1)
+        else:
+            valor_normalizado = max(0, min(valor_normalizado, 1))
+        return valor_normalizado * (max_val - min_val) + min_val
+
+    def salvar_scalers(self, tabela):
+        scaler_path = os.path.join(project_root, 'data', f'{tabela}_scalers.joblib')
+        os.makedirs(os.path.dirname(scaler_path), exist_ok=True)
+        joblib.dump(self.scalers, scaler_path)
+
+    def carregar_scalers(self, tabela):
+        scaler_path = os.path.join(project_root, 'data', f'{tabela}_scalers.joblib')
+        if os.path.exists(scaler_path):
+            self.scalers = joblib.load(scaler_path)
+        else:
+            raise ValueError(f"Scalers para a tabela {tabela} nÃ£o encontrados. Execute a normalizaÃ§Ã£o primeiro.")
+
+if __name__ == '__main__':
+    normalizador = Normalizador()
+    for tabela in ['acoes', 'fiis', 'dados_economicos']:
+        dados_normalizados = normalizador.normalizar_dados(tabela)
+        normalizador.salvar_dados_normalizados(tabela, dados_normalizados)
+
+File: app\preprocessamento\__init__.py
+------------------------
+
+File: app\preprocessamento\__pycache__\analisador_sentimento.cpython-39.pyc
+------------------------
+a
+
+    ’¯fÅ  ã                   @   sN   d dl mZ d dlmZmZ d dlZd dlZd dlZG dd„ dƒZ	dd„ Z
+dS )é    )ÚTextBlob)Ú
+AutoTokenizerÚ"AutoModelForSequenceClassificationNc                   @   s4   e Zd Zdd„ Zdd„ Zdd„ Zdd„ Zd	d
+„ ZdS )ÚAnalisadorSentimentoc                 C   s   t  d¡| _t d¡| _d S )Nz%neuralmind/bert-base-portuguese-cased)r   Zfrom_pretrainedÚ	tokenizerr   Úmodel)Úself© r	   úXC:\Users\welli\OneDrive\Documentos\finaiti\app\preprocessamento\analisador_sentimento.pyÚ__init__   s    zAnalisadorSentimento.__init__c                 C   sD   | j |ddddd}| jf i |¤}tjjj|jdd}|d  ¡ S )NÚptTi   )Zreturn_tensorsZ
+truncationÚpaddingÚ
+max_lengthéÿÿÿÿ)Údimr   )r   r   ÚtorchÚnnÚ
+functionalÚsoftmaxÚlogitsÚtolist)r   ÚtextoÚinputsÚoutputsZ
+probabilitiesr	   r	   r
+   Úanalisar   s    zAnalisadorSentimento.analisarc                 C   s2   t  dd|¡}t  dd|¡}t  dd|¡}| ¡ S )Nzhttp\S+Ú z@\w+z#\w+)ÚreÚsubÚstrip)r   r   r	   r	   r
+   Úlimpar_texto   s    z!AnalisadorSentimento.limpar_textoc                 C   s   |   |¡}t|ƒ}|jjS )N)r   r   Z	sentimentZpolarity)r   r   Ztexto_limpoZanaliser	   r	   r
+   Úanalisar_sentimento   s    
+z(AnalisadorSentimento.analisar_sentimentoc                 C   s   |d   | j¡|d< |S )Nr   Ú
+sentimento)Úapplyr    )r   Údfr	   r	   r
+   Úanalisar_tweets   s    z$AnalisadorSentimento.analisar_tweetsN)Ú__name__Ú
+__module__Ú__qualname__r   r   r   r    r$   r	   r	   r	   r
+   r      s
+   r   c                 C   s   | d | d  d d S )Né   r   é   r	   )Úprobabilidadesr	   r	   r
+   Úmapear_sentimento"   s    r+   )Ztextblobr   Ztransformersr   r   r   ÚpandasÚpdr   r   r+   r	   r	   r	   r
+   Ú<module>   s   
+
+File: app\preprocessamento\__pycache__\normalizacao.cpython-39.pyc
+------------------------
+a
+
+    ‹G¯f—  ã                   @   sº   d dl mZ d dlZd dlZd dlmZ d dlZd dl	Z	d dl
+Z
+ej ej 
+ej e¡dd¡¡Ze	j d e¡ d dlmZ G dd„ dƒZedkr¶eƒ Zd	D ]Ze e¡Ze ee¡ qšdS )
+é    )ÚloggerN)ÚMinMaxScalerz..)Ú
+GerenciadorBDc                   @   sD   e Zd Zdd„ Zdd„ Zdd„ Zdd„ Zd	d
+„ Zdd„ Zd
+d„ Z	dS )ÚNormalizadorc                 C   s   t ƒ | _i | _d S )N)r   Úgerenciador_bdÚscalers)Úself© r	   úOC:\Users\welli\OneDrive\Documentos\finaiti\app\preprocessamento\normalizacao.pyÚ__init__   s    zNormalizador.__init__c                 C   s6   || j vrtd|› ƒ‚| j | }|jd |jd fS )Nu%   Scaler nÃ£o encontrado para a coluna r   )r   Ú
+ValueErrorÚ	data_min_Ú	data_max_)r   ÚcolunaÚtabelaÚscalerr	   r	   r
+   Ú
+obter_min_max   s    
+
+zNormalizador.obter_min_maxc                 C   s    | j  |¡}|jr&t d|› ¡ d S |dks6|dkr@g d¢}n4|dkrPdg}n$|dkr`dg}nt d	|› ¡ d S | ¡ }|D ]}| j ||g ¡||< q€|S )
+Nu)   NÃ£o hÃ¡ dados para normalizar na tabela ÚacoesÚfiis)ÚaberturaÚmaximaÚminimaÚ
+fechamentoÚvolumeÚdados_economicosÚvalorÚsentimento_mercadoÚ
+sentimentou   Tabela nÃ£o reconhecida: )	r   Úobter_dadosÚemptyr   ÚwarningÚerrorÚcopyr   Ú
+fit_transform)r   r   ÚdadosZcolunas_para_normalizarÚdados_normalizadosr   r	   r	   r
+   Únormalizar_dados   s     
+zNormalizador.normalizar_dadosc              
+   C   sŠ   |j svz0|j|› d| jjddd td|› dƒ W q† tyr } z$td|› dt|ƒ› ƒ W Y d }~q†d }~0 0 ntd	|› d
+ƒ d S )NÚ
+_normalizadosÚreplaceF)Ú	if_existsÚindexzDados normalizados da tabela z salvos com sucesso.z,Erro ao salvar dados normalizados da tabela z: u2   NÃ£o hÃ¡ dados normalizados para salvar da tabela Ú.)r   Úto_sqlr   ÚengineÚprintÚ	ExceptionÚstr)r   r   r%   Úer	   r	   r
+   Úsalvar_dados_normalizados1   s    0z&Normalizador.salvar_dados_normalizadosc                 C   s`   || j vr|  |¡ |  ||¡\}}t|tjƒr@t |dd¡}ntdt|dƒƒ}|||  | S )Nr   é   )	r   Úcarregar_scalersr   Ú
+isinstanceÚnpÚndarrayÚclipÚmaxÚmin)r   Zvalor_normalizador   r   Úmin_valÚmax_valr	   r	   r
+   Údesnormalizar_valor<   s    
+
+z Normalizador.desnormalizar_valorc                 C   s>   t j td|› d¡}t jt j |¡dd t | j|¡ d S )NÚdataú_scalers.joblibT)Úexist_ok)	ÚosÚpathÚjoinÚproject_rootÚmakedirsÚdirnameÚjoblibÚdumpr   ©r   r   Zscaler_pathr	   r	   r
+   Úsalvar_scalersF   s    zNormalizador.salvar_scalersc                 C   sD   t j td|› d¡}t j |¡r0t |¡| _ntd|› dƒ‚d S )Nr>   r?   zScalers para a tabela u5    nÃ£o encontrados. Execute a normalizaÃ§Ã£o primeiro.)	rA   rB   rC   rD   ÚexistsrG   Úloadr   r   rI   r	   r	   r
+   r4   K   s    zNormalizador.carregar_scalersN)
+Ú__name__Ú
+__module__Ú__qualname__r   r   r&   r2   r=   rJ   r4   r	   r	   r	   r
+   r      s   
+r   Ú__main__)r   r   r   )Úvenvr   Únumpyr6   ÚpandasÚpdZsklearn.preprocessingr   rA   ÚsysrG   rB   ÚabspathrC   rF   Ú__file__rD   ÚinsertÚbanco_dados.gerenciador_bdr   r   rM   Únormalizadorr   r&   r%   r2   r	   r	   r	   r
+   Ú<module>   s    C
+
+
+File: app\preprocessamento\__pycache__\__init__.cpython-39.pyc
+------------------------
+a
+
+    ]H¬f    ã                   @   s   d S )N© r   r   r   úKC:\Users\welli\OneDrive\Documentos\finaiti\app\preprocessamento\__init__.pyÚ<module>   ó    
+
+File: app\__pycache__\__init__.cpython-39.pyc
+------------------------
+a
+
+    ]H¬f    ã                   @   s   d S )N© r   r   r   ú:C:\Users\welli\OneDrive\Documentos\finaiti\app\__init__.pyÚ<module>   ó    
+
+File: banco_dados\gerenciador_bd.py
+------------------------
+import os
+import sys
+import psycopg2
+import pandas as pd
+from psycopg2 import sql
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
+import logging
+import subprocess
+from sqlalchemy.engine.url import URL
+import pickle
+
+# Adicione o diretÃ³rio raiz do projeto ao PYTHONPATH
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, project_root)
+
+from config.configuracao import obter_config_bd
+
+logger = logging.getLogger(__name__)
+
+class GerenciadorBD:
+    def __init__(self):
+        url = URL.create(
+            drivername="postgresql",
+            username=os.getenv('DB_USER'),
+            password=os.getenv('DB_PASSWORD'),
+            host=os.getenv('DB_HOST'),
+            port=os.getenv('DB_PORT'),
+            database=os.getenv('DB_NAME')
+        )
+        self.engine = create_engine(url, connect_args={"connect_timeout": 5})
+        self.Session = sessionmaker(bind=self.engine)
+        logger.debug("Engine do banco de dados criado")
+
+    def testar_conexao(self):
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(text("SELECT 1"))
+                logger.info("ConexÃ£o com o banco de dados bem-sucedida!")
+                return result.fetchone()[0] == 1
+        except Exception as e:
+            logger.error(f"Erro ao conectar ao banco de dados: {str(e)}")
+            raise
+
+
+    def conectar(self):
+        return self.engine.connect()
+
+    def executar_transacao(self, queries):
+        logger.debug(f"Iniciando transaÃ§Ã£o com {len(queries)} queries")
+        try:
+            with self.conectar() as conn:
+                with conn.begin():
+                    for query in queries:
+                        conn.execute(query)
+            logger.debug("TransaÃ§Ã£o concluÃ­da com sucesso")
+        except Exception as e:
+            logger.error(f"Erro na transaÃ§Ã£o: {str(e)}", exc_info=True)
+            raise
+
+    def criar_tabela_modelos(self):
+        query = """
+        CREATE TABLE IF NOT EXISTS modelos_treinados (
+            id SERIAL PRIMARY KEY,
+            nome VARCHAR(100) UNIQUE,
+            modelo_json TEXT,
+            pesos BYTEA,
+            data_criacao TIMESTAMP
+        )
+        """
+        self.executar_query(query)
+
+    def criar_tabelas(self):
+        with self.engine.connect() as conn:
+            # Tabela acoes
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS acoes (
+                    id SERIAL PRIMARY KEY,
+                    acao VARCHAR(10),
+                    data DATE,
+                    abertura FLOAT,
+                    maxima FLOAT,
+                    minima FLOAT,
+                    fechamento FLOAT,
+                    volume FLOAT,
+                    CONSTRAINT acoes_unique UNIQUE (acao, data)
+                )
+            """))
+
+            # Tabela acoes_normalizados
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS acoes_normalizados (
+                    id SERIAL PRIMARY KEY,
+                    acao VARCHAR(10),
+                    data DATE,
+                    abertura FLOAT,
+                    maxima FLOAT,
+                    minima FLOAT,
+                    fechamento FLOAT,
+                    volume FLOAT,
+                    UNIQUE (acao, data)
+                )
+            """))
+
+            # Tabela dados_economicos
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS dados_economicos (
+                    id SERIAL PRIMARY KEY,
+                    indicador VARCHAR(50),
+                    data DATE,
+                    valor FLOAT,
+                    UNIQUE (indicador, data)
+                )
+            """))
+
+            # Tabela dados_economicos_normalizados
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS dados_economicos_normalizados (
+                    id SERIAL PRIMARY KEY,
+                    indicador VARCHAR(50),
+                    data DATE,
+                    valor FLOAT,
+                    UNIQUE (indicador, data)
+                )
+            """))
+
+            # Tabela fiis
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS fiis (
+                    id SERIAL PRIMARY KEY,
+                    fii VARCHAR(10),
+                    data DATE,
+                    abertura FLOAT,
+                    maxima FLOAT,
+                    minima FLOAT,
+                    fechamento FLOAT,
+                    volume FLOAT,
+                    dividendos FLOAT,
+                    UNIQUE (fii, data)
+                )
+            """))
+
+            # Tabela fiis_normalizados
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS fiis_normalizados (
+                    id SERIAL PRIMARY KEY,
+                    fii VARCHAR(10),
+                    data DATE,
+                    abertura FLOAT,
+                    maxima FLOAT,
+                    minima FLOAT,
+                    fechamento FLOAT,
+                    volume FLOAT,
+                    dividendos FLOAT,
+                    UNIQUE (fii, data)
+                )
+            """))
+
+            # Tabela sentimento_mercado
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS sentimento_mercado (
+                    id SERIAL PRIMARY KEY,
+                    data DATE NOT NULL,
+                    ticker VARCHAR(20) NOT NULL,
+                    sentimento FLOAT NOT NULL,
+                    CONSTRAINT sentimento_mercado_unique UNIQUE (data, ticker)
+                )
+            """))
+
+            conn.commit()
+        
+        logger.info("Todas as tabelas foram criadas ou jÃ¡ existem.")
+        
+    def criar_tabela_sentimento(self):
+        self.criar_tabelas()  # Isso criarÃ¡ todas as tabelas, incluindo sentimento_mercado
+        logger.info("Tabela sentimento_mercado criada ou jÃ¡ existente")
+
+    def inserir_dados(self, tabela, dados):
+        if not dados:
+            logger.warning(f"NÃ£o hÃ¡ dados para inserir na tabela {tabela}")
+            return
+
+        try:
+            dados_df = pd.DataFrame(dados)
+            dados_df.to_sql(tabela, self.engine, if_exists='append', index=False)
+            logger.info(f"Dados inseridos com sucesso na tabela {tabela}")
+            
+            # Verificar o conteÃºdo da tabela apÃ³s a inserÃ§Ã£o
+            verificacao = self.executar_query(f"SELECT * FROM {tabela} LIMIT 5")
+            logger.debug(f"Primeiras 5 linhas da tabela {tabela} apÃ³s inserÃ§Ã£o:\n{verificacao}")
+        except Exception as e:
+            logger.error(f"Erro ao inserir dados na tabela {tabela}: {str(e)}", exc_info=True)
+            raise
+
+    def executar_query(self, query, params=None):
+        logger.debug(f"Executando query: {query}")
+        try:
+            with self.engine.connect() as conn:
+                if isinstance(params, list):
+                    # Executar inserÃ§Ã£o em lote
+                    conn.execute(text(query), params)
+                    conn.commit()
+                    return None
+                else:
+                    result = conn.execute(text(query), params)
+                    conn.commit()
+                    if result.returns_rows:
+                        return pd.DataFrame(result.fetchall(), columns=result.keys())
+                    else:
+                        return None
+        except Exception as e:
+            logger.error(f"Erro ao executar query: {str(e)}", exc_info=True)
+            raise
+
+    def atualizar_dados(self, tabela, condicao, novos_valores):
+        try:
+            set_clause = ', '.join([f"{k} = :{k}" for k in novos_valores.keys()])
+            query = f"UPDATE {tabela} SET {set_clause} WHERE {condicao}"
+            params = {**novos_valores, **dict([c.split('=') for c in condicao.split(' AND ')])}
+            
+            with self.engine.connect() as conn:
+                conn.execute(text(query), params)
+                conn.commit()
+            logger.info(f"Dados atualizados com sucesso na tabela {tabela}")
+        except Exception as e:
+            logger.error(f"Erro ao atualizar dados na tabela {tabela}: {str(e)}", exc_info=True)
+            raise
+
+    def excluir_dados(self, tabela, condicao):
+        comando = sql.SQL("DELETE FROM {} WHERE {}").format(
+            sql.Identifier(tabela),
+            sql.SQL(condicao)
+        )
+        
+        with self.conectar() as conn:
+            with conn.begin():
+                conn.execute(comando)
+
+    def obter_dados(self, tabela):
+        comando = f"SELECT * FROM {tabela}"
+        return self.executar_query(comando)
+
+    def fazer_backup(self, caminho_backup):
+        logger.info(f"Iniciando backup do banco de dados para {caminho_backup}")
+        try:
+            comando = f"pg_dump -h {self.config['host']} -U {self.config['user']} -d {self.config['database']} -f {caminho_backup}"
+            subprocess.run(comando, shell=True, check=True)
+            logger.info("Backup concluÃ­do com sucesso")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Erro ao fazer backup: {str(e)}", exc_info=True)
+            raise
+
+    def restaurar_backup(self, caminho_backup):
+        logger.info(f"Iniciando restauraÃ§Ã£o do banco de dados a partir de {caminho_backup}")
+        try:
+            comando = f"psql -h {self.config['host']} -U {self.config['user']} -d {self.config['database']} -f {caminho_backup}"
+            subprocess.run(comando, shell=True, check=True)
+            logger.info("RestauraÃ§Ã£o concluÃ­da com sucesso")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Erro ao restaurar backup: {str(e)}", exc_info=True)
+            raise
+
+    def executar_migracao(self, caminho_script):
+        logger.info(f"Executando script de migraÃ§Ã£o: {caminho_script}")
+        try:
+            with open(caminho_script, 'r') as script:
+                comandos = script.read()
+            self.executar_transacao([comandos])
+            logger.info("MigraÃ§Ã£o concluÃ­da com sucesso")
+        except Exception as e:
+            logger.error(f"Erro ao executar migraÃ§Ã£o: {str(e)}", exc_info=True)
+            raise
+
+    def verificar_tabela(self, tabela):
+        try:
+            query = text(f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{tabela}')")
+            with self.engine.connect() as conn:
+                result = conn.execute(query)
+                exists = result.scalar()
+            logger.info(f"Tabela {tabela} {'existe' if exists else 'nÃ£o existe'}")
+            return exists
+        except Exception as e:
+            logger.error(f"Erro ao verificar tabela {tabela}: {str(e)}", exc_info=True)
+            return False
+        
+    def salvar_modelo(self, nome_modelo, modelo_json, pesos):
+        pesos_serializados = pickle.dumps(pesos)
+        query = """
+        INSERT INTO modelos_treinados (nome, modelo_json, pesos, data_criacao)
+        VALUES (:nome, :modelo_json, :pesos, CURRENT_TIMESTAMP)
+        ON CONFLICT (nome) DO UPDATE
+        SET modelo_json = :modelo_json, pesos = :pesos, data_criacao = CURRENT_TIMESTAMP
+        """
+        self.executar_query(query, {'nome': nome_modelo, 'modelo_json': modelo_json, 'pesos': pesos_serializados})
+
+    def carregar_modelo(self, nome_modelo):
+        query = "SELECT modelo_json, pesos FROM modelos_treinados WHERE nome = :nome"
+        resultado = self.executar_query(query, {'nome': nome_modelo})
+        if not resultado.empty:
+            modelo_json = resultado.iloc[0]['modelo_json']
+            pesos = pickle.loads(resultado.iloc[0]['pesos'])
+            return modelo_json, pesos
+        return None, None
+    
+    def upsert_dados(self, tabela, dados, chaves_unicas):
+        if not dados:
+            logger.warning(f"NÃ£o hÃ¡ dados para inserir/atualizar na tabela {tabela}")
+            return
+
+        try:
+            colunas = list(dados[0].keys())
+            placeholders = ', '.join([f':{col}' for col in colunas])
+            update_set = ', '.join([f"{col} = EXCLUDED.{col}" for col in colunas if col not in chaves_unicas])
+            
+            query = f"""
+                INSERT INTO {tabela} ({', '.join(colunas)})
+                VALUES ({placeholders})
+                ON CONFLICT ({', '.join(chaves_unicas)}) DO UPDATE SET
+                {update_set}
+            """
+            
+            self.executar_query(query, dados)
+            logger.info(f"Dados inseridos/atualizados com sucesso na tabela {tabela}")
+        except Exception as e:
+            logger.error(f"Erro ao inserir/atualizar dados na tabela {tabela}: {str(e)}")
+            raise
+
+    def criar_indices(self):
+        indices = [
+            ("acoes", "acao"),
+            ("acoes", "data"),
+            ("fiis", "fii"),
+            ("fiis", "data"),
+            ("dados_economicos", "indicador"),
+            ("dados_economicos", "data"),
+            ("sentimento_mercado", "ticker"),
+            ("sentimento_mercado", "data")
+        ]
+        for tabela, coluna in indices:
+            query = f"CREATE INDEX IF NOT EXISTS idx_{tabela}_{coluna} ON {tabela} ({coluna})"
+            self.executar_query(query)
+
+    def limpar_banco_dados(self):
+        tabelas = ['acoes', 'acoes_normalizados', 'fiis', 'fiis_normalizados', 
+                'dados_economicos', 'dados_economicos_normalizados', 
+                'sentimento_mercado', 'modelos_treinados']
+        
+        try:
+            with self.engine.connect() as conn:
+                for tabela in tabelas:
+                    conn.execute(text(f"TRUNCATE TABLE {tabela} RESTART IDENTITY CASCADE"))
+                conn.commit()
+            logger.info("Todas as tabelas foram limpas com sucesso.")
+        except Exception as e:
+            logger.error(f"Erro ao limpar o banco de dados: {str(e)}")
+            raise
+
+    def obter_ultima_atualizacao(self, tabela):
+        query = f"SELECT MAX(data) FROM {tabela}"
+        resultado = self.executar_query(query)
+        return resultado.iloc[0][0] if not resultado.empty else None
+
+    def obter_ultima_data(self, tabela, identificador=None):
+        if tabela == 'acoes':
+            coluna_id, coluna_data = 'acao', 'data'
+        elif tabela == 'fiis':
+            coluna_id, coluna_data = 'fii', 'data'
+        elif tabela == 'dados_economicos':
+            coluna_id, coluna_data = 'indicador', 'data'
+        elif tabela == 'sentimento_mercado':
+            coluna_id, coluna_data = 'ticker', 'data'
+        else:
+            raise ValueError(f"Tabela nÃ£o reconhecida: {tabela}")
+
+        if identificador:
+            query = f"SELECT MAX({coluna_data}) FROM {tabela} WHERE {coluna_id} = :identificador"
+            params = {'identificador': identificador}
+        else:
+            query = f"SELECT MAX({coluna_data}) FROM {tabela}"
+            params = {}
+
+        resultado = self.executar_query(query, params)
+        return resultado.iloc[0][0] if not resultado.empty and resultado.iloc[0][0] is not None else None
+    
+    def adicionar_restricao_unicidade(self, tabela, colunas):
+        constraint_name = f"{tabela}_{'_'.join(colunas)}_unique"
+        query = f"""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM information_schema.table_constraints
+                WHERE constraint_name = '{constraint_name}'
+            ) THEN
+                ALTER TABLE {tabela}
+                ADD CONSTRAINT {constraint_name} UNIQUE ({', '.join(colunas)});
+            END IF;
+        END $$;
+        """
+        self.executar_query(query)
+        logger.info(f"RestriÃ§Ã£o de unicidade adicionada ou jÃ¡ existente para {tabela}: {colunas}")
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.DEBUG)
+    gerenciador = GerenciadorBD()
+    gerenciador.criar_tabelas()
+    gerenciador.criar_tabela_sentimento()
+
+File: banco_dados\__init__.py
+------------------------
+
+File: banco_dados\__pycache__\gerenciador_bd.cpython-39.pyc
+------------------------
+a
+
+    `N¯fÒ?  ã                   @   sø   d dl Z d dlZd dlZd dlZd dlmZ d dlmZmZ d dl	m
+Z
+ d dlmZ d dl
+Z
+d dlZd dlmZ d dlZe j e j e j e¡d¡¡Zej d e¡ d dlmZ e
+ e¡ZG d	d
+„ d
+ƒZedkrôe
+je
+j d eƒ Z!e! "¡  e! #¡  dS )
+é    N)Úsql)Ú
+create_engineÚtext)Úsessionmaker)Ú	QueuePool)ÚURLz..)Úobter_config_bdc                   @   sĞ   e Zd Zdd„ Zdd„ Zdd„ Zdd„ Zd	d
+„ Zdd„ Zd
+d„ Z	dd„ Z
+d2dd„Zdd„ Zdd„ Z
+dd„ Zdd„ Zdd„ Zdd„ Zd d!„ Zd"d#„ Zd$d%„ Zd&d'„ Zd(d)„ Zd*d+„ Zd,d-„ Zd3d.d/„Zd0d1„ ZdS )4Ú
+GerenciadorBDc              	   C   sb   t jdt d¡t d¡t d¡t d¡t d¡d}t|dd	id
+| _t| jd| _t 	d¡ d S )
+NZ
+postgresqlÚDB_USERÚDB_PASSWORDÚDB_HOSTÚDB_PORTÚDB_NAME)Z
+drivernameÚusernameÚpasswordÚhostÚportÚdatabaseÚconnect_timeouté   )Zconnect_args)ÚbindzEngine do banco de dados criado)
+r   ÚcreateÚosÚgetenvr   Úenginer   ÚSessionÚloggerÚdebug)ÚselfÚurl© r    úHC:\Users\welli\OneDrive\Documentos\finaiti\banco_dados\gerenciador_bd.pyÚ__init__   s    úzGerenciadorBD.__init__c              
+   C   s˜   zX| j  ¡ :}| tdƒ¡}t d¡ | ¡ d dkW  d   ƒ W S 1 sL0    Y  W n: ty’ } z"t dt	|ƒ› ¡ ‚ W Y d }~n
+d }~0 0 d S )NzSELECT 1u+   ConexÃ£o com o banco de dados bem-sucedida!r   é   z$Erro ao conectar ao banco de dados: )
+r   ÚconnectÚexecuter   r   ÚinfoÚfetchoneÚ	ExceptionÚerrorÚstr)r   ÚconnÚresultÚer    r    r!   Útestar_conexao$   s    
+4zGerenciadorBD.testar_conexaoc                 C   s
+   | j  ¡ S )N)r   r$   ©r   r    r    r!   Úconectar/   s    zGerenciadorBD.conectarc              
+   C   sÌ   t  dt|ƒ› d¡ zr|  ¡ L}| ¡ $ |D ]}| |¡ q0W d   ƒ n1 sT0    Y  W d   ƒ n1 sr0    Y  t  d¡ W n> tyÆ } z&t jdt|ƒ› dd ‚ W Y d }~n
+d }~0 0 d S )Nu   Iniciando transaÃ§Ã£o com z queriesu"   TransaÃ§Ã£o concluÃ­da com sucessou   Erro na transaÃ§Ã£o: T©Úexc_info)	r   r   Úlenr0   Úbeginr%   r(   r)   r*   )r   Zqueriesr+   Úqueryr-   r    r    r!   Úexecutar_transacao2   s    
+
+Hz GerenciadorBD.executar_transacaoc                 C   s   d}|   |¡ d S )Nzí
+        CREATE TABLE IF NOT EXISTS modelos_treinados (
+            id SERIAL PRIMARY KEY,
+            nome VARCHAR(100) UNIQUE,
+            modelo_json TEXT,
+            pesos BYTEA,
+            data_criacao TIMESTAMP
+        )
+        ©Úexecutar_query)r   r5   r    r    r!   Úcriar_tabela_modelos>   s    	z"GerenciadorBD.criar_tabela_modelosc                 C   s¢   | j  ¡ z}| tdƒ¡ | tdƒ¡ | tdƒ¡ | tdƒ¡ | tdƒ¡ | tdƒ¡ | tdƒ¡ | ¡  W d   ƒ n1 sŠ0    Y  t d¡ d S )	Na²  
+                CREATE TABLE IF NOT EXISTS acoes (
+                    id SERIAL PRIMARY KEY,
+                    acao VARCHAR(10),
+                    data DATE,
+                    abertura FLOAT,
+                    maxima FLOAT,
+                    minima FLOAT,
+                    fechamento FLOAT,
+                    volume FLOAT,
+                    CONSTRAINT acoes_unique UNIQUE (acao, data)
+                )
+            a§  
+                CREATE TABLE IF NOT EXISTS acoes_normalizados (
+                    id SERIAL PRIMARY KEY,
+                    acao VARCHAR(10),
+                    data DATE,
+                    abertura FLOAT,
+                    maxima FLOAT,
+                    minima FLOAT,
+                    fechamento FLOAT,
+                    volume FLOAT,
+                    UNIQUE (acao, data)
+                )
+            a   
+                CREATE TABLE IF NOT EXISTS dados_economicos (
+                    id SERIAL PRIMARY KEY,
+                    indicador VARCHAR(50),
+                    data DATE,
+                    valor FLOAT,
+                    UNIQUE (indicador, data)
+                )
+            a-  
+                CREATE TABLE IF NOT EXISTS dados_economicos_normalizados (
+                    id SERIAL PRIMARY KEY,
+                    indicador VARCHAR(50),
+                    data DATE,
+                    valor FLOAT,
+                    UNIQUE (indicador, data)
+                )
+            a½  
+                CREATE TABLE IF NOT EXISTS fiis (
+                    id SERIAL PRIMARY KEY,
+                    fii VARCHAR(10),
+                    data DATE,
+                    abertura FLOAT,
+                    maxima FLOAT,
+                    minima FLOAT,
+                    fechamento FLOAT,
+                    volume FLOAT,
+                    dividendos FLOAT,
+                    UNIQUE (fii, data)
+                )
+            aÊ  
+                CREATE TABLE IF NOT EXISTS fiis_normalizados (
+                    id SERIAL PRIMARY KEY,
+                    fii VARCHAR(10),
+                    data DATE,
+                    abertura FLOAT,
+                    maxima FLOAT,
+                    minima FLOAT,
+                    fechamento FLOAT,
+                    volume FLOAT,
+                    dividendos FLOAT,
+                    UNIQUE (fii, data)
+                )
+            aa  
+                CREATE TABLE IF NOT EXISTS sentimento_mercado (
+                    id SERIAL PRIMARY KEY,
+                    data DATE NOT NULL,
+                    ticker VARCHAR(20) NOT NULL,
+                    sentimento FLOAT NOT NULL,
+                    CONSTRAINT sentimento_mercado_unique UNIQUE (data, ticker)
+                )
+            u.   Todas as tabelas foram criadas ou jÃ¡ existem.)r   r$   r%   r   Úcommitr   r&   )r   r+   r    r    r!   Ú
+criar_tabelasJ   s    
+&zGerenciadorBD.criar_tabelasc                 C   s   |   ¡  t d¡ d S )Nu1   Tabela sentimento_mercado criada ou jÃ¡ existente)r;   r   r&   r/   r    r    r!   Úcriar_tabela_sentimento¯   s    z%GerenciadorBD.criar_tabela_sentimentoc              
+   C   s¼   |st  d|› ¡ d S zZt |¡}|j|| jddd t  d|› ¡ |  d|› d¡}t  d|› d	|› ¡ W nD t	y¶ } z,t j
+d
+|› dt|ƒ› dd
+ ‚ W Y d }~n
+d }~0 0 d S )Nu&   NÃ£o hÃ¡ dados para inserir na tabela ÚappendF)Ú	if_existsÚindexz&Dados inseridos com sucesso na tabela úSELECT * FROM z LIMIT 5zPrimeiras 5 linhas da tabela u    apÃ³s inserÃ§Ã£o:
+z Erro ao inserir dados na tabela ú: Tr1   )r   ÚwarningÚpdÚ	DataFrameÚto_sqlr   r&   r8   r   r(   r)   r*   )r   ÚtabelaÚdadosZdados_dfZverificacaor-   r    r    r!   Ú
+inserir_dados³   s    
+zGerenciadorBD.inserir_dadosNc              
+   C   s  t  d|› ¡ z¸| j ¡ š}t|tƒrR| t|ƒ|¡ | ¡  W d   ƒ W d S | t|ƒ|¡}| ¡  |j	r–t
+j| ¡ | 
+¡ dW  d   ƒ W S W d   ƒ W d S W d   ƒ n1 s¼0    Y  W n@ ty } z&t jdt|ƒ› dd ‚ W Y d }~n
+d }~0 0 d S )NzExecutando query: )ÚcolumnszErro ao executar query: Tr1   )r   r   r   r$   Ú
+isinstanceÚlistr%   r   r:   Zreturns_rowsrC   rD   ÚfetchallÚkeysr(   r)   r*   )r   r5   Úparamsr+   r,   r-   r    r    r!   r8   Ä   s    
+&4zGerenciadorBD.executar_queryc           	   
+   C   sî   z¤d  dd„ | ¡ D ƒ¡}d|› d|› d|› }i |¥tdd„ | d¡D ƒƒ¥}| j ¡ (}| t|ƒ|¡ | ¡  W d   ƒ n1 sˆ0    Y  t	 
+d	|› ¡ W nD tyè } z,t	jd
+|› dt
+|ƒ› dd
+ ‚ W Y d }~n
+d }~0 0 d S )Nú, c                 S   s   g | ]}|› d |› ‘qS )z = :r    )Ú.0Úkr    r    r!   Ú
+<listcomp>Ú   ó    z1GerenciadorBD.atualizar_dados.<locals>.<listcomp>zUPDATE z SET ú WHERE c                 S   s   g | ]}|  d ¡‘qS )ú=)Úsplit)rP   Úcr    r    r!   rR   Ü   rS   z AND z(Dados atualizados com sucesso na tabela z"Erro ao atualizar dados na tabela rA   Tr1   )ÚjoinrM   ÚdictrV   r   r$   r%   r   r:   r   r&   r(   r)   r*   )	r   rF   ÚcondicaoZ
+novos_valoresZ
+set_clauser5   rN   r+   r-   r    r    r!   Úatualizar_dadosØ   s     &zGerenciadorBD.atualizar_dadosc              	   C   s|   t  d¡ t  |¡t  |¡¡}|  ¡ B}| ¡  | |¡ W d   ƒ n1 sP0    Y  W d   ƒ n1 sn0    Y  d S )NzDELETE FROM {} WHERE {})r   ZSQLÚformatÚ
+Identifierr0   r4   r%   )r   rF   rZ   Úcomandor+   r    r    r!   Ú
+excluir_dadosæ   s    
+ş
+
+zGerenciadorBD.excluir_dadosc                 C   s   d|› }|   |¡S )Nr@   r7   )r   rF   r^   r    r    r!   Úobter_dadosğ   s    
+zGerenciadorBD.obter_dadosc              
+   C   s¢   t  d|› ¡ zLd| jd › d| jd › d| jd › d|› }tj|d	d	d
+ t  d¡ W n@ tjyœ } z&t jdt|ƒ› d	d
+ ‚ W Y d }~n
+d }~0 0 d S )Nz(Iniciando backup do banco de dados para zpg_dump -h r   ú -U Úuserú -d r   ú -f T©ÚshellÚchecku   Backup concluÃ­do com sucessozErro ao fazer backup: r1   ©r   r&   ÚconfigÚ
+subprocessÚrunÚCalledProcessErrorr)   r*   ©r   Zcaminho_backupr^   r-   r    r    r!   Úfazer_backupô   s    .zGerenciadorBD.fazer_backupc              
+   C   s¢   t  d|› ¡ zLd| jd › d| jd › d| jd › d|› }tj|d	d	d
+ t  d¡ W n@ tjyœ } z&t jdt|ƒ› d	d
+ ‚ W Y d }~n
+d }~0 0 d S )Nu6   Iniciando restauraÃ§Ã£o do banco de dados a partir de zpsql -h r   ra   rb   rc   r   rd   Tre   u$   RestauraÃ§Ã£o concluÃ­da com sucessozErro ao restaurar backup: r1   rh   rm   r    r    r!   Úrestaurar_backupş   s    .zGerenciadorBD.restaurar_backupc              
+   C   s    t  d|› ¡ zLt|dƒ}| ¡ }W d   ƒ n1 s:0    Y  |  |g¡ t  d¡ W n> tyš } z&t jdt|ƒ› dd ‚ W Y d }~n
+d }~0 0 d S )Nu!   Executando script de migraÃ§Ã£o: Úru!   MigraÃ§Ã£o concluÃ­da com sucessou   Erro ao executar migraÃ§Ã£o: Tr1   )r   r&   ÚopenÚreadr6   r(   r)   r*   )r   Zcaminho_scriptÚscriptZcomandosr-   r    r    r!   Úexecutar_migracao  s    &zGerenciadorBD.executar_migracaoc              
+   C   sº   zpt d|› dƒ}| j ¡ "}| |¡}| ¡ }W d   ƒ n1 sD0    Y  t d|› d|rbdnd› ¡ |W S  ty´ } z,tjd|› dt	|ƒ› d	d
+ W Y d }~dS d }~0 0 d S )NzISELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'z')zTabela ú Zexisteu   nÃ£o existezErro ao verificar tabela rA   Tr1   F)
+r   r   r$   r%   Úscalarr   r&   r(   r)   r*   )r   rF   r5   r+   r,   Úexistsr-   r    r    r!   Úverificar_tabela  s    
+&zGerenciadorBD.verificar_tabelac                 C   s&   t  |¡}d}|  ||||dœ¡ d S )Na  
+        INSERT INTO modelos_treinados (nome, modelo_json, pesos, data_criacao)
+        VALUES (:nome, :modelo_json, :pesos, CURRENT_TIMESTAMP)
+        ON CONFLICT (nome) DO UPDATE
+        SET modelo_json = :modelo_json, pesos = :pesos, data_criacao = CURRENT_TIMESTAMP
+        )ÚnomeÚmodelo_jsonÚpesos)ÚpickleÚdumpsr8   )r   Únome_modelorz   r{   Zpesos_serializadosr5   r    r    r!   Ú
+salvar_modelo  s    
+zGerenciadorBD.salvar_modeloc                 C   sH   d}|   |d|i¡}|jsD|jd d }t |jd d ¡}||fS dS )NzCSELECT modelo_json, pesos FROM modelos_treinados WHERE nome = :nomery   r   rz   r{   )NN)r8   ÚemptyÚilocr|   Úloads)r   r~   r5   Ú	resultadorz   r{   r    r    r!   Úcarregar_modelo)  s    zGerenciadorBD.carregar_modeloc           	         sê   |st  d|› ¡ d S zŒt|d  ¡ ƒ}d dd„ |D ƒ¡}d ‡ fdd„|D ƒ¡}d|› dd |¡› d	|› d
+d ˆ ¡› d|› d}|  ||¡ t  d
+|› ¡ W n@ tyä } z(t  d|› dt	|ƒ› ¡ ‚ W Y d }~n
+d }~0 0 d S )Nu0   NÃ£o hÃ¡ dados para inserir/atualizar na tabela r   rO   c                 S   s   g | ]}d |› ‘qS )ú:r    ©rP   Úcolr    r    r!   rR   9  rS   z.GerenciadorBD.upsert_dados.<locals>.<listcomp>c                    s"   g | ]}|ˆ vr|› d |› ‘qS )z = EXCLUDED.r    r†   ©Ú
+chaves_unicasr    r!   rR   :  rS   z
+                INSERT INTO ú (z)
+                VALUES (z)
+                ON CONFLICT (z ) DO UPDATE SET
+                z
+            z2Dados inseridos/atualizados com sucesso na tabela z*Erro ao inserir/atualizar dados na tabela rA   )
+r   rB   rK   rM   rX   r8   r&   r(   r)   r*   )	r   rF   rG   r‰   ÚcolunasZplaceholdersZ
+update_setr5   r-   r    rˆ   r!   Úupsert_dados2  s.    ÿÿşıüzGerenciadorBD.upsert_dadosc              
+   C   sB   g d¢}|D ]0\}}d|› d|› d|› d|› d	}|   |¡ qd S )N))ÚacoesÚacao)r   Údata)ÚfiisÚfii)r   r   )Údados_economicosÚ	indicador)r’   r   )Úsentimento_mercadoÚticker)r”   r   zCREATE INDEX IF NOT EXISTS idx_Ú_z ON rŠ   ú)r7   )r   ÚindicesrF   Zcolunar5   r    r    r!   Ú
+criar_indicesI  s    
+zGerenciadorBD.criar_indicesc              
+   C   s¨   g d¢}z`| j  ¡ 8}|D ]}| td|› dƒ¡ q| ¡  W d   ƒ n1 sR0    Y  t d¡ W n: ty¢ } z"t dt	|ƒ› ¡ ‚ W Y d }~n
+d }~0 0 d S )N)r   Zacoes_normalizadosr   Zfiis_normalizadosr’   Zdados_economicos_normalizadosr”   Zmodelos_treinadoszTRUNCATE TABLE z RESTART IDENTITY CASCADEz*Todas as tabelas foram limpas com sucesso.z!Erro ao limpar o banco de dados: )
+r   r$   r%   r   r:   r   r&   r(   r)   r*   )r   Ztabelasr+   rF   r-   r    r    r!   Úlimpar_banco_dadosX  s    &z GerenciadorBD.limpar_banco_dadosc                 C   s,   d|› }|   |¡}|js(|jd d S d S )NzSELECT MAX(data) FROM r   )r8   r€   r   )r   rF   r5   rƒ   r    r    r!   Úobter_ultima_atualizacaog  s    
+
+z&GerenciadorBD.obter_ultima_atualizacaoc                 C   sÆ   |dkrd\}}nD|dkr$d\}}n2|dkr6d\}}n |dkrHd\}}nt d	|› ƒ‚|r|d
+|› d|› d|› d
+}d|i}nd
+|› d|› }i }|  ||¡}|jsÂ|jd d d urÂ|jd d S d S )Nr   )r   r   r   )r‘   r   r’   )r“   r   r”   )r•   r   u   Tabela nÃ£o reconhecida: zSELECT MAX(z) FROM rT   z = :identificadorÚ
+identificadorr   )Ú
+ValueErrorr8   r€   r   )r   rF   rœ   Z	coluna_idZcoluna_datar5   rN   rƒ   r    r    r!   Úobter_ultima_datal  s     
+
+
+
+
+zGerenciadorBD.obter_ultima_datac              
+   C   s^   |› dd  |¡› d}d|› d|› d|› dd  |¡› d	}|  |¡ t d	|› d
+|› ¡ d S )Nr–   Ú_uniquezµ
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM information_schema.table_constraints
+                WHERE constraint_name = 'z1'
+            ) THEN
+                ALTER TABLE z 
+                ADD CONSTRAINT z	 UNIQUE (rO   z/);
+            END IF;
+        END $$;
+        u:   RestriÃ§Ã£o de unicidade adicionada ou jÃ¡ existente para rA   )rX   r8   r   r&   )r   rF   r‹   Zconstraint_namer5   r    r    r!   Úadicionar_restricao_unicidade‚  s    úø	÷	÷
+z+GerenciadorBD.adicionar_restricao_unicidade)N)N)Ú__name__Ú
+__module__Ú__qualname__r"   r.   r0   r6   r9   r;   r<   rH   r8   r[   r_   r`   rn   ro   rt   rx   r   r„   rŒ   r™   rš   r›   r   r    r    r    r    r!   r	      s0   
+e
+
+
+
+
+	
+r	   Ú__main__)Úlevel)$r   ÚsysÚpsycopg2ÚpandasrC   r   Ú
+sqlalchemyr   r   Zsqlalchemy.ormr   Zsqlalchemy.poolr   Úloggingrj   Zsqlalchemy.engine.urlr   r|   ÚpathÚabspathrX   ÚdirnameÚ__file__Zproject_rootÚinsertZconfig.configuracaor   Ú	getLoggerr¡   r   r	   ÚbasicConfigÚDEBUGZgerenciadorr;   r<   r    r    r    r!   Ú<module>   s0   
+   
+
+File: banco_dados\__pycache__\__init__.cpython-39.pyc
+------------------------
+a
+
+    ]H¬f    ã                   @   s   d S )N© r   r   r   úBC:\Users\welli\OneDrive\Documentos\finaiti\banco_dados\__init__.pyÚ<module>   ó    
+
+File: config\configuracao.py
+------------------------
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def obter_config_bd():
+    return {
+        'host': os.getenv('DB_HOST'),
+        'port': os.getenv('DB_PORT'),
+        'database': os.getenv('DB_NAME'),
+        'user': os.getenv('DB_USER'),
+        'password': os.getenv('DB_PASSWORD')
+    }
+
+File: config\__init__.py
+------------------------
+
+File: config\__pycache__\configuracao.cpython-39.pyc
+------------------------
+a
+
+    ò@¬f7  ã                   @   s&   d dl Z d dlmZ eƒ  dd„ ZdS )é    N)Úload_dotenvc                   C   s.   t  d¡t  d¡t  d¡t  d¡t  d¡dœS )NÚDB_HOSTÚDB_PORTÚDB_NAMEÚDB_USERÚDB_PASSWORD)ÚhostÚportÚdatabaseÚuserÚpassword)ÚosÚgetenv© r   r   úAC:\Users\welli\OneDrive\Documentos\finaiti\config\configuracao.pyÚobter_config_bd   s    ûr   )r
+   Údotenvr   r   r   r   r   r   Ú<module>   s   
+
+File: config\__pycache__\__init__.cpython-39.pyc
+------------------------
+a
+
+    ]H¬f    ã                   @   s   d S )N© r   r   r   ú=C:\Users\welli\OneDrive\Documentos\finaiti\config\__init__.pyÚ<module>   ó    
+
+File: data\acoes_scalers.joblib
+------------------------
+€•N      }”(Œabertura”Œsklearn.preprocessing._data”ŒMinMaxScaler”“”)”}”(Œ
+feature_range”K K†”Œcopy”ˆŒclip”‰Œfeature_names_in_”Œjoblib.numpy_pickle”ŒNumpyArrayWrapper”“”)”}”(Œsubclass”Œnumpy”Œndarray”“”Œshape”K…”Œorder”ŒC”Œdtype”hŒdtype”“”ŒO8”‰ˆ‡”R”(KŒ|”NNNJÿÿÿÿJÿÿÿÿK?t”bŒ
+allow_mmap”‰Œnumpy_array_alignment_bytes”Kub€cnumpy.core.multiarray
+_reconstruct
+q cnumpy
+ndarray
+qK …qc_codecs
+encode
+qX   bqX   latin1q†qRq‡qRq	(KK…q
+cnumpy
+dtype
+qX   O8q‰ˆ‡q
+Rq(KX   |qNNNJÿÿÿÿJÿÿÿÿK?tqb‰]qX   aberturaqatqb.•x       Œn_features_in_”KŒn_samples_seen_”M@¼Œscale_”h)”}”(hhhK…”hhhhŒf8”‰ˆ‡”R”(KŒ<”NNNJÿÿÿÿJÿÿÿÿK t”bh!ˆh"Kubÿÿÿÿÿcìœš‚’‹?•*       Œmin_”h)”}”(hhhK…”hhhh+h!ˆh"Kubÿÿÿÿ        •/       Œ	data_min_”h)”}”(hhhK…”hhhh+h!ˆh"Kubÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ        •/       Œ	data_max_”h)”}”(hhhK…”hhhh+h!ˆh"Kubÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ6õlÁ‘R@•1       Œdata_range_”h)”}”(hhhK…”hhhh+h!ˆh"Kub
+ÿÿÿÿÿÿÿÿÿÿÿÿÿ6õlÁ‘R@•]       Œ_sklearn_version”Œ1.5.0”ubŒmaxima”h)”}”(hhh	ˆh
+‰hh)”}”(hhhK…”hhhhh!‰h"Kub€cnumpy.core.multiarray
+_reconstruct
+q cnumpy
+ndarray
+qK …qc_codecs
+encode
+qX   bqX   latin1q†qRq‡qRq	(KK…q
+cnumpy
+dtype
+qX   O8q‰ˆ‡q
+Rq(KX   |qNNNJÿÿÿÿJÿÿÿÿK?tqb‰]qX   maximaqatqb.•.       h#Kh$M@¼h%h)”}”(hhhK…”hhhh+h!ˆh"Kubÿÿÿÿÿÿÿÿÿÿÿÿ›©>YZ\‹?•%       h.h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h2h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h6h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿĞÏæ‚¶R@•%       h:h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿĞÏæ‚¶R@•F       h>h?ubŒminima”h)”}”(hhh	ˆh
+‰hh)”}”(hhhK…”hhhhh!‰h"Kub€cnumpy.core.multiarray
+_reconstruct
+q cnumpy
+ndarray
+qK …qc_codecs
+encode
+qX   bqX   latin1q†qRq‡qRq	(KK…q
+cnumpy
+dtype
+qX   O8q‰ˆ‡q
+Rq(KX   |qNNNJÿÿÿÿJÿÿÿÿK?tqb‰]qX   minimaqatqb.•.       h#Kh$M@¼h%h)”}”(hhhK…”hhhh+h!ˆh"Kubÿÿÿ±õé[e×‹?•%       h.h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h2h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h6h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ(~³”ÏcR@•%       h:h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ(~³”ÏcR@•J       h>h?ubŒ
+fechamento”h)”}”(hhh	ˆh
+‰hh)”}”(hhhK…”hhhhh!‰h"Kub€cnumpy.core.multiarray
+_reconstruct
+q cnumpy
+ndarray
+qK …qc_codecs
+encode
+qX   bqX   latin1q†qRq‡qRq	(KK…q
+cnumpy
+dtype
+qX   O8q‰ˆ‡q
+Rq(KX   |qNNNJÿÿÿÿJÿÿÿÿK?tqb‰]qX
+   fechamentoqatqb.•.       h#Kh$M@¼h%h)”}”(hhhK…”hhhh+h!ˆh"Kubÿÿÿÿÿÿÿÿÿÿÿ	fñ7WÑ”?•%       h.h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿê˜7l2à¿•%       h2h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ   @­å8@•%       h6h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ    …R@•%       h:h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ   `+˜H@•F       h>h?ubŒvolume”h)”}”(hhh	ˆh
+‰hh)”}”(hhhK…”hhhhh!‰h"Kub€cnumpy.core.multiarray
+_reconstruct
+q cnumpy
+ndarray
+qK …qc_codecs
+encode
+qX   bqX   latin1q†qRq‡qRq	(KK…q
+cnumpy
+dtype
+qX   O8q‰ˆ‡q
+Rq(KX   |qNNNJÿÿÿÿJÿÿÿÿK?tqb‰]qX   volumeqatqb.•.       h#Kh$M@¼h%h)”}”(hhhK…”hhhh+h!ˆh"KubÿÿÿY^¢½Ï¤2>•%       h.h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h2h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h6h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ   Tv«A•%       h:h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ   Tv«A•l       h>h?ubŒ
+dividendos”h)”}”(hhh	ˆh
+‰hh)”}”(hhhK…”hhhhŒO8”‰ˆ‡”R”(KhNNNJÿÿÿÿJÿÿÿÿK?t”bh!‰h"Kub€cnumpy.core.multiarray
+_reconstruct
+q cnumpy
+ndarray
+qK …qc_codecs
+encode
+qX   bqX   latin1q†qRq‡qRq	(KK…q
+cnumpy
+dtype
+qX   O8q‰ˆ‡q
+Rq(KX   |qNNNJÿÿÿÿJÿÿÿÿK?tqb‰]qX
+   dividendosqatqb.•P       h#Kh$M—h%h)”}”(hhhK…”hhhhŒf8”‰ˆ‡”R”(Kh,NNNJÿÿÿÿJÿÿÿÿK t”bh!ˆh"Kubÿÿÿÿÿÿÿ]tÑEí?•%       h.h)”}”(hhhK…”hhhh£h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h2h)”}”(hhhK…”hhhh£h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h6h)”}”(hhhK…”hhhh£h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿš™™™™™ñ?•%       h:h)”}”(hhhK…”hhhh£h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿš™™™™™ñ?•       h>h?ubu.
+
+File: data\dados_economicos_scalers.joblib
+------------------------
+€•J      }”Œvalor”Œsklearn.preprocessing._data”ŒMinMaxScaler”“”)”}”(Œ
+feature_range”K K†”Œcopy”ˆŒclip”‰Œfeature_names_in_”Œjoblib.numpy_pickle”ŒNumpyArrayWrapper”“”)”}”(Œsubclass”Œnumpy”Œndarray”“”Œshape”K…”Œorder”ŒC”Œdtype”hŒdtype”“”ŒO8”‰ˆ‡”R”(KŒ|”NNNJÿÿÿÿJÿÿÿÿK?t”bŒ
+allow_mmap”‰Œnumpy_array_alignment_bytes”Kub€cnumpy.core.multiarray
+_reconstruct
+q cnumpy
+ndarray
+qK …qc_codecs
+encode
+qX   bqX   latin1q†qRq‡qRq	(KK…q
+cnumpy
+dtype
+qX   O8q‰ˆ‡q
+Rq(KX   |qNNNJÿÿÿÿJÿÿÿÿK?tqb‰]qX   valorqatqb.•x       Œn_features_in_”KŒn_samples_seen_”MòŒscale_”h)”}”(hhhK…”hhhhŒf8”‰ˆ‡”R”(KŒ<”NNNJÿÿÿÿJÿÿÿÿK t”bh!ˆh"Kubÿÿÿÿÿÿÿÿÿÿÿÿ7°vE.±>•*       Œmin_”h)”}”(hhhK…”hhhh+h!ˆh"Kubÿÿÿÿ•@‰&¦]§>•/       Œ	data_min_”h)”}”(hhhK…”hhhh+h!ˆh"KubÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÃõ(\Âå¿•/       Œ	data_max_”h)”}”(hhhK…”hhhh+h!ˆh"KubÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÍÌÌÌÿÌ-A•1       Œdata_range_”h)”}”(hhhK…”hhhh+h!ˆh"Kub
+ÿÿÿÿÿÿÿÿÿÿÿÿÿÂõ(Í-A•       Œ_sklearn_version”Œ1.5.0”ubs.
+
+File: data\fiis_scalers.joblib
+------------------------
+€•N      }”(Œabertura”Œsklearn.preprocessing._data”ŒMinMaxScaler”“”)”}”(Œ
+feature_range”K K†”Œcopy”ˆŒclip”‰Œfeature_names_in_”Œjoblib.numpy_pickle”ŒNumpyArrayWrapper”“”)”}”(Œsubclass”Œnumpy”Œndarray”“”Œshape”K…”Œorder”ŒC”Œdtype”hŒdtype”“”ŒO8”‰ˆ‡”R”(KŒ|”NNNJÿÿÿÿJÿÿÿÿK?t”bŒ
+allow_mmap”‰Œnumpy_array_alignment_bytes”Kub€cnumpy.core.multiarray
+_reconstruct
+q cnumpy
+ndarray
+qK …qc_codecs
+encode
+qX   bqX   latin1q†qRq‡qRq	(KK…q
+cnumpy
+dtype
+qX   O8q‰ˆ‡q
+Rq(KX   |qNNNJÿÿÿÿJÿÿÿÿK?tqb‰]qX   aberturaqatqb.•x       Œn_features_in_”KŒn_samples_seen_”M—Œscale_”h)”}”(hhhK…”hhhhŒf8”‰ˆ‡”R”(KŒ<”NNNJÿÿÿÿJÿÿÿÿK t”bh!ˆh"Kubÿÿÿÿÿ¿À2Lªx?•*       Œmin_”h)”}”(hhhK…”hhhh+h!ˆh"Kubÿÿÿÿ        •/       Œ	data_min_”h)”}”(hhhK…”hhhh+h!ˆh"Kubÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ        •/       Œ	data_max_”h)”}”(hhhK…”hhhh+h!ˆh"Kubÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿºn
+Âd@•1       Œdata_range_”h)”}”(hhhK…”hhhh+h!ˆh"Kub
+ÿÿÿÿÿÿÿÿÿÿÿÿÿºn
+Âd@•]       Œ_sklearn_version”Œ1.5.0”ubŒmaxima”h)”}”(hhh	ˆh
+‰hh)”}”(hhhK…”hhhhh!‰h"Kub€cnumpy.core.multiarray
+_reconstruct
+q cnumpy
+ndarray
+qK …qc_codecs
+encode
+qX   bqX   latin1q†qRq‡qRq	(KK…q
+cnumpy
+dtype
+qX   O8q‰ˆ‡q
+Rq(KX   |qNNNJÿÿÿÿJÿÿÿÿK?tqb‰]qX   maximaqatqb.•.       h#Kh$M—h%h)”}”(hhhK…”hhhh+h!ˆh"Kubÿÿÿÿÿÿÿÿÿÿÿÿûz†a¿¤x?•%       h.h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h2h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h6h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ=üé·Æd@•%       h:h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ=üé·Æd@•F       h>h?ubŒminima”h)”}”(hhh	ˆh
+‰hh)”}”(hhhK…”hhhhh!‰h"Kub€cnumpy.core.multiarray
+_reconstruct
+q cnumpy
+ndarray
+qK …qc_codecs
+encode
+qX   bqX   latin1q†qRq‡qRq	(KK…q
+cnumpy
+dtype
+qX   O8q‰ˆ‡q
+Rq(KX   |qNNNJÿÿÿÿJÿÿÿÿK?tqb‰]qX   minimaqatqb.•.       h#Kh$M—h%h)”}”(hhhK…”hhhh+h!ˆh"Kubÿÿÿ“ª‚ÉÎx?•%       h.h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h2h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h6h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ‹÷Hğ£d@•%       h:h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ‹÷Hğ£d@•J       h>h?ubŒ
+fechamento”h)”}”(hhh	ˆh
+‰hh)”}”(hhhK…”hhhhh!‰h"Kub€cnumpy.core.multiarray
+_reconstruct
+q cnumpy
+ndarray
+qK …qc_codecs
+encode
+qX   bqX   latin1q†qRq‡qRq	(KK…q
+cnumpy
+dtype
+qX   O8q‰ˆ‡q
+Rq(KX   |qNNNJÿÿÿÿJÿÿÿÿK?tqb‰]qX
+   fechamentoqatqb.•.       h#Kh$M—h%h)”}”(hhhK…”hhhh+h!ˆh"Kubÿÿÿÿÿÿÿÿÿÿÿ
+S„èyz?•%       h.h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿi
+ºò®¿•%       h2h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ   €™p"@•%       h6h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ    
+Âd@•%       h:h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ   ›c@•F       h>h?ubŒvolume”h)”}”(hhh	ˆh
+‰hh)”}”(hhhK…”hhhhh!‰h"Kub€cnumpy.core.multiarray
+_reconstruct
+q cnumpy
+ndarray
+qK …qc_codecs
+encode
+qX   bqX   latin1q†qRq‡qRq	(KK…q
+cnumpy
+dtype
+qX   O8q‰ˆ‡q
+Rq(KX   |qNNNJÿÿÿÿJÿÿÿÿK?tqb‰]qX   volumeqatqb.•.       h#Kh$M—h%h)”}”(hhhK…”hhhh+h!ˆh"KubÿÿÿSFWÚ¿«~>•%       h.h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h2h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h6h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ   `±`A•%       h:h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ   `±`A•J       h>h?ubŒ
+dividendos”h)”}”(hhh	ˆh
+‰hh)”}”(hhhK…”hhhhh!‰h"Kub€cnumpy.core.multiarray
+_reconstruct
+q cnumpy
+ndarray
+qK …qc_codecs
+encode
+qX   bqX   latin1q†qRq‡qRq	(KK…q
+cnumpy
+dtype
+qX   O8q‰ˆ‡q
+Rq(KX   |qNNNJÿÿÿÿJÿÿÿÿK?tqb‰]qX
+   dividendosqatqb.•.       h#Kh$M—h%h)”}”(hhhK…”hhhh+h!ˆh"Kubÿÿÿÿÿÿÿÿÿÿÿ]tÑEí?•%       h.h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h2h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿ        •%       h6h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿš™™™™™ñ?•%       h:h)”}”(hhhK…”hhhh+h!ˆh"Kub	ÿÿÿÿÿÿÿÿÿš™™™™™ñ?•       h>h?ubu.
+
+File: templates\index.html
+------------------------
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PrevisÃ£o de AÃ§Ãµes e FIIs - FinAIti</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/moment"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-moment"></script>
+</head>
+<body>
+    <div class="container mt-5">
+        <h1 class="mb-4">PrevisÃ£o de AÃ§Ãµes e FIIs - FinAIti</h1>
+        
+        <div class="row">
+            <div class="col-md-6">
+                <h2>Treinar Modelo</h2>
+                <form id="trainForm" class="mb-4">
+                    <div class="mb-3">
+                        <label for="tabela" class="form-label">Tabela:</label>
+                        <select id="tabela" name="tabela" class="form-select">
+                            <option value="acoes">AÃ§Ãµes</option>
+                            <option value="fiis">FIIs</option>
+                            <option value="dados_economicos">Dados EconÃ´micos</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="btn btn-primary" id="trainButton">Treinar Modelo</button>
+                </form>
+                <div id="message" class="alert" style="display: none;"></div>
+            </div>
+            
+            <div class="col-md-6">
+                <h2>Fazer PrevisÃ£o</h2>
+                <form id="predictForm" class="mb-4">
+                    <div class="mb-3">
+                        <label for="predictTabela" class="form-label">Tabela:</label>
+                        <select id="predictTabela" name="predictTabela" class="form-select">
+                            <option value="acoes">AÃ§Ãµes</option>
+                            <option value="fiis">FIIs</option>
+                        </select>
+                    </div>
+                    <div id="tickerCheckboxes" class="mb-3">
+                        <!-- Checkboxes serÃ£o adicionados aqui dinamicamente -->
+                    </div>
+                    <button type="submit" class="btn btn-success" id="predictButton">Fazer PrevisÃ£o</button>
+                </form>
+            </div>
+        </div>
+        
+        <div id="resultado" class="mt-4" style="display: none;">
+            <h3>Resultado da PrevisÃ£o</h3>
+            <p id="previsaoTexto"></p>
+            <canvas id="previsaoGrafico" width="400" height="200"></canvas>
+        </div>
+    </div>
+    <div id="resultado" class="mt-4" style="display: none;">
+        <h3>Resultado da PrevisÃ£o</h3>
+        <p id="previsaoTexto"></p>
+        <p id="sentimentoTexto"></p>
+        <canvas id="previsaoGrafico" width="400" height="200"></canvas>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        console.log("Chart.js carregado:", typeof Chart !== 'undefined');
+
+        const predictTabela = document.getElementById('predictTabela');
+        const tickerCheckboxes = document.getElementById('tickerCheckboxes');
+        const acoes = JSON.parse('{{ acoes|tojson|safe }}');
+        const fiis = JSON.parse('{{ fiis|tojson|safe }}');
+
+        function createCheckboxes(lista) {
+            tickerCheckboxes.innerHTML = '';
+            lista.forEach(item => {
+                const div = document.createElement('div');
+                div.className = 'form-check';
+                const input = document.createElement('input');
+                input.type = 'checkbox';
+                input.className = 'form-check-input';
+                input.id = item;
+                input.name = 'tickers';
+                input.value = item;
+                const label = document.createElement('label');
+                label.className = 'form-check-label';
+                label.htmlFor = item;
+                label.textContent = item;
+                div.appendChild(input);
+                div.appendChild(label);
+                tickerCheckboxes.appendChild(div);
+            });
+        }
+
+        predictTabela.addEventListener('change', function() {
+            const lista = this.value === 'acoes' ? acoes : fiis;
+            createCheckboxes(lista);
+        });
+
+        // Inicializar checkboxes com aÃ§Ãµes
+        createCheckboxes(acoes);
+
+        document.getElementById('trainForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const tabela = document.getElementById('tabela').value;
+            const trainButton = document.getElementById('trainButton');
+            trainButton.disabled = true;
+            trainButton.textContent = 'Treinando...';
+
+            fetch('/treinar', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: `tabela=${tabela}`
+            })
+            .then(response => response.json())
+            .then(data => {
+                const messageElement = document.getElementById('message');
+                messageElement.textContent = data.message || data.error;
+                messageElement.style.display = 'block';
+                messageElement.className = data.error ? 'alert alert-danger' : 'alert alert-success';
+            })
+            .catch(error => {
+                console.error('Erro:', error);
+                const messageElement = document.getElementById('message');
+                messageElement.textContent = 'Ocorreu um erro ao treinar o modelo.';
+                messageElement.style.display = 'block';
+                messageElement.className = 'alert alert-danger';
+            })
+            .finally(() => {
+                trainButton.disabled = false;
+                trainButton.textContent = 'Treinar Modelo';
+            });
+        });
+
+        document.getElementById('predictForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const tabela = document.getElementById('predictTabela').value;
+            const tickers = Array.from(document.querySelectorAll('input[name="tickers"]:checked')).map(el => el.value);
+            const predictButton = document.getElementById('predictButton');
+            predictButton.disabled = true;
+            predictButton.textContent = 'Prevendo...';
+
+            console.log("Enviando requisiÃ§Ã£o de previsÃ£o...");
+
+            const params = new URLSearchParams();
+            params.append('tabela', tabela);
+            tickers.forEach(ticker => params.append('tickers', ticker));
+
+            fetch(`/prever?${params.toString()}`)
+            .then(response => {
+                console.log("Resposta recebida");
+                return response.json();
+            })
+            .then(data => {
+                console.log("Dados recebidos:", data);
+                if (data.erro) {
+                    alert(data.erro);
+                } else {
+                    document.getElementById('resultado').style.display = 'block';
+                    document.getElementById('previsaoTexto').textContent = `PrevisÃ£o realizada para ${tickers.join(', ')}`;
+                    console.log("Chamando renderizarGrafico");
+                    renderizarGrafico(data);
+                }
+            })
+            .catch(error => {
+                console.error('Erro:', error);
+                alert('Ocorreu um erro ao fazer a previsÃ£o.');
+            })
+            .finally(() => {
+                predictButton.disabled = false;
+                predictButton.textContent = 'Fazer PrevisÃ£o';
+            });
+        });
+
+        function renderizarGrafico(data) {
+            console.log("Dados recebidos para o grÃ¡fico:", data);
+            
+            const ctx = document.getElementById('previsaoGrafico').getContext('2d');
+            
+            if (window.previsaoChart) {
+                window.previsaoChart.destroy();
+            }
+
+            const datasets = [];
+            const colors = ['rgb(75, 192, 192)', 'rgb(255, 99, 132)', 'rgb(54, 162, 235)', 'rgb(255, 206, 86)', 'rgb(153, 102, 255)'];
+
+            Object.keys(data).forEach((ticker, index) => {
+                const tickerData = data[ticker];
+                datasets.push({
+                    label: `${ticker} - HistÃ³rico`,
+                    data: tickerData.ultimos_valores_reais.map((valor, i) => ({x: tickerData.datas_historicas[i], y: valor})),
+                    borderColor: colors[index % colors.length],
+                    tension: 0.1,
+                    pointRadius: 0
+                });
+                datasets.push({
+                    label: `${ticker} - PrevisÃ£o`,
+                    data: tickerData.previsao.map((valor, i) => ({x: tickerData.datas_futuras[i], y: valor})),
+                    borderColor: colors[index % colors.length],
+                    borderDash: [5, 5],
+                    tension: 0.1,
+                    pointRadius: 0
+                });
+
+                document.getElementById('sentimentoTexto').textContent += `Sentimento mÃ©dio para ${ticker}: ${tickerData.sentimento_medio.toFixed(2)} `;
+            });
+
+            window.previsaoChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    datasets: datasets
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                unit: 'day',
+                                parser: 'yyyy-MM-dd',
+                                tooltipFormat: 'll'
+                            },
+                            title: {
+                                display: true,
+                                text: 'Data'
+                            }
+                        },
+                        y: {
+                            beginAtZero: false,
+                            title: {
+                                display: true,
+                                text: 'Valor'
+                            }
+                        }
+                    },
+                    plugins: {
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false
+                        },
+                        legend: {
+                            position: 'top',
+                        }
+                    }
+                }
+            });
+        }
+    </script>
+</body>
+</html>
+
+File: testes\__init__.py
+------------------------
+
+File: web\__init__.py
+------------------------
+

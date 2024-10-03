@@ -1,0 +1,13 @@
+.env
+best_model.pt
+celerybeat-schedule.bak
+celerybeat-schedule.dat
+celerybeat-schedule.dir
+checkpoint.pt
+project_content
+project_structure
+__init__
+modelos
+instance
+data
+cache_dir

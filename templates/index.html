@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Previsão de Ações e FIIs - FinAIti</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/moment"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-moment"></script>
+</head>
+<body>
+    <div class="container mt-5">
+        <h1 class="mb-4">Previsão de Ações e FIIs - FinAIti</h1>
+        
+        <div class="row">
+            <div class="col-md-6">
+                <h2>Treinar Modelo</h2>
+                <form id="trainForm" class="mb-4">
+                    <div class="mb-3">
+                        <label for="tabela" class="form-label">Tabela:</label>
+                        <select id="tabela" name="tabela" class="form-select">
+                            <option value="acoes">Ações</option>
+                            <option value="fiis">FIIs</option>
+                            <option value="dados_economicos">Dados Econômicos</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="btn btn-primary" id="trainButton">Treinar Modelo</button>
+                </form>
+                <div id="message" class="alert" style="display: none;"></div>
+            </div>
+            
+            <div class="col-md-6">
+                <h2>Fazer Previsão</h2>
+                <form id="predictForm" class="mb-4">
+                    <div class="mb-3">
+                        <label for="predictTabela" class="form-label">Tabela:</label>
+                        <select id="predictTabela" name="predictTabela" class="form-select">
+                            <option value="acoes">Ações</option>
+                            <option value="fiis">FIIs</option>
+                        </select>
+                    </div>
+                    <div id="tickerCheckboxes" class="mb-3">
+                        <!-- Checkboxes serão adicionados aqui dinamicamente -->
+                    </div>
+                    <button type="submit" class="btn btn-success" id="predictButton">Fazer Previsão</button>
+                </form>
+            </div>
+        </div>
+        
+        <div id="resultado" class="mt-4" style="display: none;">
+            <h3>Resultado da Previsão</h3>
+            <p id="previsaoTexto"></p>
+            <canvas id="previsaoGrafico" width="400" height="200"></canvas>
+        </div>
+    </div>
+    <div id="resultado" class="mt-4" style="display: none;">
+        <h3>Resultado da Previsão</h3>
+        <p id="previsaoTexto"></p>
+        <p id="sentimentoTexto"></p>
+        <canvas id="previsaoGrafico" width="400" height="200"></canvas>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        console.log("Chart.js carregado:", typeof Chart !== 'undefined');
+
+        const predictTabela = document.getElementById('predictTabela');
+        const tickerCheckboxes = document.getElementById('tickerCheckboxes');
+        const acoes = JSON.parse('{{ acoes|tojson|safe }}');
+        const fiis = JSON.parse('{{ fiis|tojson|safe }}');
+
+        function createCheckboxes(lista) {
+            tickerCheckboxes.innerHTML = '';
+            lista.forEach(item => {
+                const div = document.createElement('div');
+                div.className = 'form-check';
+                const input = document.createElement('input');
+                input.type = 'checkbox';
+                input.className = 'form-check-input';
+                input.id = item;
+                input.name = 'tickers';
+                input.value = item;
+                const label = document.createElement('label');
+                label.className = 'form-check-label';
+                label.htmlFor = item;
+                label.textContent = item;
+                div.appendChild(input);
+                div.appendChild(label);
+                tickerCheckboxes.appendChild(div);
+            });
+        }
+
+        predictTabela.addEventListener('change', function() {
+            const lista = this.value === 'acoes' ? acoes : fiis;
+            createCheckboxes(lista);
+        });
+
+        // Inicializar checkboxes com ações
+        createCheckboxes(acoes);
+
+        document.getElementById('trainForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const tabela = document.getElementById('tabela').value;
+            const trainButton = document.getElementById('trainButton');
+            trainButton.disabled = true;
+            trainButton.textContent = 'Treinando...';
+
+            fetch('/treinar', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: `tabela=${tabela}`
+            })
+            .then(response => response.json())
+            .then(data => {
+                const messageElement = document.getElementById('message');
+                messageElement.textContent = data.message || data.error;
+                messageElement.style.display = 'block';
+                messageElement.className = data.error ? 'alert alert-danger' : 'alert alert-success';
+            })
+            .catch(error => {
+                console.error('Erro:', error);
+                const messageElement = document.getElementById('message');
+                messageElement.textContent = 'Ocorreu um erro ao treinar o modelo.';
+                messageElement.style.display = 'block';
+                messageElement.className = 'alert alert-danger';
+            })
+            .finally(() => {
+                trainButton.disabled = false;
+                trainButton.textContent = 'Treinar Modelo';
+            });
+        });
+
+        document.getElementById('predictForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const tabela = document.getElementById('predictTabela').value;
+            const tickers = Array.from(document.querySelectorAll('input[name="tickers"]:checked')).map(el => el.value);
+            const predictButton = document.getElementById('predictButton');
+            predictButton.disabled = true;
+            predictButton.textContent = 'Prevendo...';
+
+            console.log("Enviando requisição de previsão...");
+
+            const params = new URLSearchParams();
+            params.append('tabela', tabela);
+            tickers.forEach(ticker => params.append('tickers', ticker));
+
+            fetch(`/prever?${params.toString()}`)
+            .then(response => {
+                console.log("Resposta recebida");
+                return response.json();
+            })
+            .then(data => {
+                console.log("Dados recebidos:", data);
+                if (data.erro) {
+                    alert(data.erro);
+                } else {
+                    document.getElementById('resultado').style.display = 'block';
+                    document.getElementById('previsaoTexto').textContent = `Previsão realizada para ${tickers.join(', ')}`;
+                    console.log("Chamando renderizarGrafico");
+                    renderizarGrafico(data);
+                }
+            })
+            .catch(error => {
+                console.error('Erro:', error);
+                alert('Ocorreu um erro ao fazer a previsão.');
+            })
+            .finally(() => {
+                predictButton.disabled = false;
+                predictButton.textContent = 'Fazer Previsão';
+            });
+        });
+
+        function renderizarGrafico(data) {
+            console.log("Dados recebidos para o gráfico:", data);
+            
+            const ctx = document.getElementById('previsaoGrafico').getContext('2d');
+            
+            if (window.previsaoChart) {
+                window.previsaoChart.destroy();
+            }
+
+            const datasets = [];
+            const colors = ['rgb(75, 192, 192)', 'rgb(255, 99, 132)', 'rgb(54, 162, 235)', 'rgb(255, 206, 86)', 'rgb(153, 102, 255)'];
+
+            Object.keys(data).forEach((ticker, index) => {
+                const tickerData = data[ticker];
+                datasets.push({
+                    label: `${ticker} - Histórico`,
+                    data: tickerData.ultimos_valores_reais.map((valor, i) => ({x: tickerData.datas_historicas[i], y: valor})),
+                    borderColor: colors[index % colors.length],
+                    tension: 0.1,
+                    pointRadius: 0
+                });
+                datasets.push({
+                    label: `${ticker} - Previsão`,
+                    data: tickerData.previsao.map((valor, i) => ({x: tickerData.datas_futuras[i], y: valor})),
+                    borderColor: colors[index % colors.length],
+                    borderDash: [5, 5],
+                    tension: 0.1,
+                    pointRadius: 0
+                });
+
+                document.getElementById('sentimentoTexto').textContent += `Sentimento médio para ${ticker}: ${tickerData.sentimento_medio.toFixed(2)} `;
+            });
+
+            window.previsaoChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    datasets: datasets
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                unit: 'day',
+                                parser: 'yyyy-MM-dd',
+                                tooltipFormat: 'll'
+                            },
+                            title: {
+                                display: true,
+                                text: 'Data'
+                            }
+                        },
+                        y: {
+                            beginAtZero: false,
+                            title: {
+                                display: true,
+                                text: 'Valor'
+                            }
+                        }
+                    },
+                    plugins: {
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false
+                        },
+                        legend: {
+                            position: 'top',
+                        }
+                    }
+                }
+            });
+        }
+    </script>
+</body>
+</html>
